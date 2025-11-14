@@ -7,8 +7,11 @@
     volumes:
       - "/iothub/dvr-upload/logs:/app/dvr-upload/logs"
       - "/iothub/dvr-upload/uploadFile:/data/upload"
+      - "/iothub/dvr-upload/backupFile:/data/backup"
       - "/iothub/jimi-upload-process/uploadFile:/data/upload/jtt"
     environment:
       - ENABLE_SECRET=true
       - SECRET_KEY=jimidvr@123!443
       - LOCAL_VIDEO_PATH=/data/upload
+      - BACKUP_VIDEO_PATH=/data/backup
+      - DISASTER_RECOVERY_MODE=true

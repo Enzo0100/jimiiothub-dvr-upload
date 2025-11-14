@@ -27,10 +27,12 @@ type JSONResponse struct {
 const maxFilenameLength = 255
 
 var (
-	secretKey    = getEnv("SECRET_KEY", "jimidvr@123!443")
-	enableSecret = getEnv("ENABLE_SECRET", "true") == "true"
-	videoPath    = getEnv("LOCAL_VIDEO_PATH", "/data/upload")
-	logFilePath  = "/app/dvr-upload/logs/server.log"
+	secretKey            = getEnv("SECRET_KEY", "jimidvr@123!443")
+	enableSecret         = getEnv("ENABLE_SECRET", "true") == "true"
+	videoPath            = getEnv("LOCAL_VIDEO_PATH", "/data/upload")
+	backupPath           = getEnv("BACKUP_VIDEO_PATH", "/data/dvr-upload-backup")
+	disasterRecoveryMode = getEnv("DISASTER_RECOVERY_MODE", "false") == "true"
+	logFilePath          = "/app/dvr-upload/logs/server.log"
 )
 
 func main() {
@@ -105,21 +107,100 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	dstPath := filepath.Join(videoPath, finalFilename)
+	if disasterRecoveryMode {
+		// Modo de recuperação de desastres: salvar diretamente no backup
+		if backupPath == "" {
+			log.Printf("[UploadServer] Disaster Recovery mode is ON but BACKUP_VIDEO_PATH is not set.")
+			writeJSON(w, http.StatusInternalServerError, JSONResponse{Code: 500, Message: "Disaster recovery misconfigured"})
+			return
+		}
+		backupDestPath := filepath.Join(backupPath, finalFilename)
+		if err := saveUploadedFile(file, backupDestPath); err != nil {
+			writeJSON(w, http.StatusInternalServerError, JSONResponse{Code: 500, Message: err.Error()})
+			return
+		}
+		log.Printf("[UploadServer] Upload success (DR mode): %s", finalFilename)
+	} else {
+		// Modo normal: salvar no caminho principal e depois copiar para o backup
+		dstPath := filepath.Join(videoPath, finalFilename)
+		if err := saveUploadedFile(file, dstPath); err != nil {
+			writeJSON(w, http.StatusInternalServerError, JSONResponse{Code: 500, Message: err.Error()})
+			return
+		}
+
+		// Se o backup estiver habilitado, copie o arquivo em segundo plano
+		if backupPath != "" {
+			go func(srcPath, dstFilename string) {
+				if err := copyToBackup(srcPath, dstFilename); err != nil {
+					log.Printf("[Backup] Failed to backup %s: %v", dstFilename, err)
+				}
+			}(dstPath, finalFilename)
+		}
+		log.Printf("[UploadServer] Upload success: %s", finalFilename)
+	}
+
+	writeJSON(w, http.StatusOK, JSONResponse{Code: 200, Message: "File upload success", Data: finalFilename})
+}
+
+// saveUploadedFile cria e salva o conteúdo de um multipart.File em um caminho de destino.
+func saveUploadedFile(file multipart.File, dstPath string) error {
+	// Certifique-se de que o diretório de destino exista
+	if err := os.MkdirAll(filepath.Dir(dstPath), 0755); err != nil {
+		log.Printf("[UploadServer] Failed to create directory for %s: %v", dstPath, err)
+		return fmt.Errorf("failed to create directory")
+	}
+
 	dst, err := os.Create(dstPath)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, JSONResponse{Code: 500, Message: "Failed to save file"})
-		return
+		log.Printf("[UploadServer] Failed to create file %s: %v", dstPath, err)
+		return fmt.Errorf("failed to save file")
 	}
 	defer dst.Close()
 
-	if _, err := io.Copy(dst, file); err != nil {
-		writeJSON(w, http.StatusInternalServerError, JSONResponse{Code: 500, Message: "Write failed"})
-		return
+	// Volte ao início do arquivo de upload para garantir que ele possa ser lido
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		log.Printf("[UploadServer] Failed to seek file before saving to %s: %v", dstPath, err)
+		return fmt.Errorf("failed to read upload stream")
 	}
 
-	log.Printf("[UploadServer] Upload success: %s", finalFilename)
-	writeJSON(w, http.StatusOK, JSONResponse{Code: 200, Message: "File upload success", Data: finalFilename})
+	if _, err := io.Copy(dst, file); err != nil {
+		log.Printf("[UploadServer] Failed to write to file %s: %v", dstPath, err)
+		return fmt.Errorf("write failed")
+	}
+
+	return nil
+}
+
+func copyToBackup(srcPath, filename string) error {
+	log.Printf("[Backup] Starting backup for %s", filename)
+
+	// 1. Abrir o arquivo de origem
+	srcFile, err := os.Open(srcPath)
+	if err != nil {
+		return fmt.Errorf("failed to open source file: %w", err)
+	}
+	defer srcFile.Close()
+
+	// 2. Criar a estrutura de diretórios do backup
+	backupDestPath := filepath.Join(backupPath, filename)
+	if err := os.MkdirAll(filepath.Dir(backupDestPath), 0755); err != nil {
+		return fmt.Errorf("failed to create backup directory: %w", err)
+	}
+
+	// 3. Criar o arquivo de destino no backup
+	dstFile, err := os.Create(backupDestPath)
+	if err != nil {
+		return fmt.Errorf("failed to create backup file: %w", err)
+	}
+	defer dstFile.Close()
+
+	// 4. Copiar o conteúdo
+	if _, err := io.Copy(dstFile, srcFile); err != nil {
+		return fmt.Errorf("failed to copy file content to backup: %w", err)
+	}
+
+	log.Printf("[Backup] Successfully backed up %s to %s", filename, backupDestPath)
+	return nil
 }
 
 func generateSign(filename, timestamp, secret string) string {
