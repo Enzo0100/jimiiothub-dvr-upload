@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"mime/multipart"
 	"net/http"
 	"os"
@@ -16,6 +15,9 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/google/uuid"
+	"github.com/sirupsen/logrus"
 )
 
 type JSONResponse struct {
@@ -27,6 +29,7 @@ type JSONResponse struct {
 const maxFilenameLength = 255
 
 var (
+	log                  = logrus.New()
 	secretKey            = getEnv("SECRET_KEY", "jimidvr@123!443")
 	enableSecret         = getEnv("ENABLE_SECRET", "true") == "true"
 	videoPath            = getEnv("LOCAL_VIDEO_PATH", "/data/upload")
@@ -37,14 +40,24 @@ var (
 
 func main() {
 	// setup logging
+	log.SetFormatter(&logrus.JSONFormatter{})
+	log.SetLevel(logrus.InfoLevel)
 	if err := os.MkdirAll(filepath.Dir(logFilePath), 0755); err == nil {
 		f, err := os.OpenFile(logFilePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 		if err == nil {
-			log.SetOutput(f)
+			// log to file and console
+			mw := io.MultiWriter(os.Stdout, f)
+			log.SetOutput(mw)
 		}
 	}
 
-	log.Printf("[UploadServer] Starting on :23010, saving files to %s", videoPath)
+	log.WithFields(logrus.Fields{
+		"listen_addr": ":23010",
+		"video_path":  videoPath,
+		"backup_path": backupPath,
+		"dr_mode":     disasterRecoveryMode,
+	}).Info("[UploadServer] Starting server")
+
 	os.MkdirAll(videoPath, 0755)
 
 	http.HandleFunc("/upload", uploadHandler)
@@ -53,17 +66,32 @@ func main() {
 }
 
 func uploadHandler(w http.ResponseWriter, r *http.Request) {
+	requestID := uuid.New().String()
+	logger := log.WithFields(logrus.Fields{
+		"request_id":  requestID,
+		"remote_addr": r.RemoteAddr,
+		"method":      r.Method,
+		"uri":         r.RequestURI,
+	})
+
+	logger.Info("Upload request received")
+
 	if err := r.ParseMultipartForm(64 << 20); err != nil {
+		logger.WithError(err).Error("Failed to parse multipart form")
 		writeJSON(w, http.StatusBadRequest, JSONResponse{Code: 400, Message: "Invalid form data"})
 		return
 	}
 
 	file, handler, err := r.FormFile("file")
 	if err != nil {
+		logger.WithError(err).Error("File is required in the form")
 		writeJSON(w, http.StatusBadRequest, JSONResponse{Code: 400, Message: "File is required"})
 		return
 	}
 	defer file.Close()
+
+	fileSize := handler.Size
+	logger = logger.WithField("original_filesize", fileSize)
 
 	// Original provided (may be empty / not trusted)
 	providedFilename := r.FormValue("filename")
@@ -86,9 +114,17 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 	// sanitize path
 	finalFilename = filepath.Base(finalFilename)
 
-	log.Printf("[UploadServer] Received orig=%s computed=%s timestamp=%s sign=%s err=%v", handler.Filename, finalFilename, timestamp, sign, buildErr)
+	reqLogger := logger.WithFields(logrus.Fields{
+		"original_filename": handler.Filename,
+		"final_filename":    finalFilename,
+		"provided_filename": providedFilename,
+		"timestamp":         timestamp,
+		"build_error":       buildErr,
+	})
+	reqLogger.Info("Processing file upload")
 
 	if len(finalFilename) > maxFilenameLength {
+		reqLogger.Error("Final filename exceeds max length")
 		writeJSON(w, http.StatusInternalServerError, JSONResponse{Code: 500, Message: "File name too long"})
 		return
 	}
@@ -101,78 +137,111 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		expected := generateSign(baseForSign, timestamp, secretKey)
 		if sign != expected {
-			log.Printf("[UploadServer] Invalid signature: %s (expected %s) for filename=%s", sign, expected, finalFilename)
+			reqLogger.WithFields(logrus.Fields{
+				"received_sign": sign,
+				"expected_sign": expected,
+				"base_for_sign": baseForSign,
+			}).Warn("Invalid signature")
 			writeJSON(w, http.StatusBadRequest, JSONResponse{Code: 400, Message: "Signature error"})
 			return
 		}
+		reqLogger.Info("Signature validated successfully")
 	}
 
+	var bytesWritten int64
 	if disasterRecoveryMode {
 		// Modo de recuperação de desastres: salvar diretamente no backup
 		if backupPath == "" {
-			log.Printf("[UploadServer] Disaster Recovery mode is ON but BACKUP_VIDEO_PATH is not set.")
+			reqLogger.Error("Disaster Recovery mode is ON but BACKUP_VIDEO_PATH is not set.")
 			writeJSON(w, http.StatusInternalServerError, JSONResponse{Code: 500, Message: "Disaster recovery misconfigured"})
 			return
 		}
 		backupDestPath := filepath.Join(backupPath, finalFilename)
-		if err := saveUploadedFile(file, backupDestPath); err != nil {
+		bytesWritten, err = saveUploadedFile(file, backupDestPath, reqLogger)
+		if err != nil {
+			// Error is already logged in saveUploadedFile
 			writeJSON(w, http.StatusInternalServerError, JSONResponse{Code: 500, Message: err.Error()})
 			return
 		}
-		log.Printf("[UploadServer] Upload success (DR mode): %s", finalFilename)
+		reqLogger.WithFields(logrus.Fields{
+			"path":          backupDestPath,
+			"bytes_written": bytesWritten,
+		}).Info("Upload success (DR mode)")
 	} else {
 		// Modo normal: salvar no caminho principal e depois copiar para o backup
 		dstPath := filepath.Join(videoPath, finalFilename)
-		if err := saveUploadedFile(file, dstPath); err != nil {
+		bytesWritten, err = saveUploadedFile(file, dstPath, reqLogger)
+		if err != nil {
+			// Error is already logged in saveUploadedFile
 			writeJSON(w, http.StatusInternalServerError, JSONResponse{Code: 500, Message: err.Error()})
 			return
 		}
 
 		// Se o backup estiver habilitado, copie o arquivo em segundo plano
 		if backupPath != "" {
-			go func(srcPath, dstFilename string) {
-				if err := copyToBackup(srcPath, dstFilename); err != nil {
-					log.Printf("[Backup] Failed to backup %s: %v", dstFilename, err)
+			go func(srcPath, dstFilename string, parentLogger *logrus.Entry) {
+				if err := copyToBackup(srcPath, dstFilename, parentLogger); err != nil {
+					parentLogger.WithError(err).Errorf("Failed to backup %s", dstFilename)
 				}
-			}(dstPath, finalFilename)
+			}(dstPath, finalFilename, reqLogger)
 		}
-		log.Printf("[UploadServer] Upload success: %s", finalFilename)
+		reqLogger.WithFields(logrus.Fields{
+			"path":          dstPath,
+			"bytes_written": bytesWritten,
+		}).Info("Upload success")
+	}
+
+	if fileSize != bytesWritten {
+		reqLogger.Warnf("File size mismatch. Original: %d, Written: %d. Possible incomplete upload.", fileSize, bytesWritten)
 	}
 
 	writeJSON(w, http.StatusOK, JSONResponse{Code: 200, Message: "File upload success", Data: finalFilename})
 }
 
 // saveUploadedFile cria e salva o conteúdo de um multipart.File em um caminho de destino.
-func saveUploadedFile(file multipart.File, dstPath string) error {
+func saveUploadedFile(file multipart.File, dstPath string, logger *logrus.Entry) (int64, error) {
 	// Certifique-se de que o diretório de destino exista
 	if err := os.MkdirAll(filepath.Dir(dstPath), 0755); err != nil {
-		log.Printf("[UploadServer] Failed to create directory for %s: %v", dstPath, err)
-		return fmt.Errorf("failed to create directory")
+		logger.WithError(err).WithField("path", dstPath).Error("Failed to create directory for file")
+		return 0, fmt.Errorf("failed to create directory")
 	}
 
 	dst, err := os.Create(dstPath)
 	if err != nil {
-		log.Printf("[UploadServer] Failed to create file %s: %v", dstPath, err)
-		return fmt.Errorf("failed to save file")
+		logger.WithError(err).WithField("path", dstPath).Error("Failed to create destination file")
+		return 0, fmt.Errorf("failed to save file")
 	}
 	defer dst.Close()
 
 	// Volte ao início do arquivo de upload para garantir que ele possa ser lido
 	if _, err := file.Seek(0, io.SeekStart); err != nil {
-		log.Printf("[UploadServer] Failed to seek file before saving to %s: %v", dstPath, err)
-		return fmt.Errorf("failed to read upload stream")
+		logger.WithError(err).Error("Failed to seek to the start of the uploaded file stream")
+		return 0, fmt.Errorf("failed to read upload stream")
 	}
 
-	if _, err := io.Copy(dst, file); err != nil {
-		log.Printf("[UploadServer] Failed to write to file %s: %v", dstPath, err)
-		return fmt.Errorf("write failed")
+	logger.WithField("destination_path", dstPath).Info("Starting file write operation")
+	bytesWritten, err := io.Copy(dst, file)
+	if err != nil {
+		// Tenta remover o arquivo parcial em caso de erro de escrita
+		os.Remove(dstPath)
+		logger.WithError(err).WithFields(logrus.Fields{
+			"path":          dstPath,
+			"bytes_written": bytesWritten,
+		}).Error("Failed to write file content, partial file deleted")
+		return bytesWritten, fmt.Errorf("write failed")
 	}
 
-	return nil
+	logger.WithFields(logrus.Fields{
+		"path":          dstPath,
+		"bytes_written": bytesWritten,
+	}).Info("File written successfully")
+
+	return bytesWritten, nil
 }
 
-func copyToBackup(srcPath, filename string) error {
-	log.Printf("[Backup] Starting backup for %s", filename)
+func copyToBackup(srcPath, filename string, logger *logrus.Entry) error {
+	backupLogger := logger.WithField("backup_process", true)
+	backupLogger.Infof("Starting backup for %s", filename)
 
 	// 1. Abrir o arquivo de origem
 	srcFile, err := os.Open(srcPath)
@@ -195,11 +264,17 @@ func copyToBackup(srcPath, filename string) error {
 	defer dstFile.Close()
 
 	// 4. Copiar o conteúdo
-	if _, err := io.Copy(dstFile, srcFile); err != nil {
-		return fmt.Errorf("failed to copy file content to backup: %w", err)
+	bytesCopied, err := io.Copy(dstFile, srcFile)
+	if err != nil {
+		os.Remove(backupDestPath) // Remove partial backup file
+		return fmt.Errorf("failed to copy file content to backup (copied %d bytes): %w", bytesCopied, err)
 	}
 
-	log.Printf("[Backup] Successfully backed up %s to %s", filename, backupDestPath)
+	backupLogger.WithFields(logrus.Fields{
+		"source_path":  srcPath,
+		"backup_path":  backupDestPath,
+		"bytes_copied": bytesCopied,
+	}).Infof("Successfully backed up %s", filename)
 	return nil
 }
 
