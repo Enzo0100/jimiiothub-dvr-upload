@@ -1,0 +1,14 @@
+  dvr-upload:
+    restart: always
+    container_name: dvr-upload
+    image: enzo0001/dvr-upload:v1.0.1
+    ports:
+      - "23010:23010"
+    volumes:
+      - "/iothub/dvr-upload/logs:/app/dvr-upload/logs"
+      - "/iothub/dvr-upload/uploadFile:/data/upload"
+      - "/iothub/jimi-upload-process/uploadFile:/data/upload/jtt"
+    environment:
+      - ENABLE_SECRET=true
+      - SECRET_KEY=jimidvr@123!443
+      - LOCAL_VIDEO_PATH=/data/upload
