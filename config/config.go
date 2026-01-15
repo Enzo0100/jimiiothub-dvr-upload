@@ -12,6 +12,7 @@ type Config struct {
 	BackupPath           string
 	DisasterRecoveryMode bool
 	EnableLocalStorage   bool
+	EnableTsToMp4        bool
 	LogFilePath          string
 
 	// S3 Configuration (OCI Compatibility)
@@ -31,6 +32,7 @@ func LoadConfig() *Config {
 		BackupPath:           getEnv("BACKUP_VIDEO_PATH", "/data/dvr-upload-backup"),
 		DisasterRecoveryMode: getEnv("DISASTER_RECOVERY_MODE", "false") == "true",
 		EnableLocalStorage:   getEnv("ENABLE_LOCAL_STORAGE", "true") == "true",
+		EnableTsToMp4:        getEnv("ENABLE_TS_TO_MP4", "true") == "true",
 		LogFilePath:          "/app/dvr-upload/logs/server.log",
 
 		S3Bucket:       getEnv("OCI_BUCKET_MEDIA", ""),

@@ -151,12 +151,30 @@ func (h *Handler) UploadHandler(w http.ResponseWriter, r *http.Request) {
 
 	go func(path string, filename string, logger *logrus.Entry, isLocal bool) {
 		uploadPath := path
+		uploadFilename := filename
 		ext := strings.ToLower(filepath.Ext(filename))
-		if ext == ".mp4" || ext == ".ts" {
-			compressedPath, err := processor.CompressWithFFmpeg(path, logger)
+
+		// Conversão opcional TS -> MP4 antes do upload.
+		if ext == ".ts" && h.cfg.EnableTsToMp4 {
+			convertedPath, err := processor.ConvertTSToMP4(path, logger)
 			if err == nil {
 				if !isLocal {
 					os.Remove(path)
+				}
+				uploadPath = convertedPath
+				uploadFilename = strings.TrimSuffix(filename, ext) + ".mp4"
+				defer os.Remove(convertedPath)
+			} else {
+				logger.WithError(err).Warn("TS->MP4 conversion failed, will attempt to upload original")
+			}
+		}
+
+		// Mantém a compressão atual apenas para MP4 (se aplicável).
+		if ext == ".mp4" {
+			compressedPath, err := processor.CompressWithFFmpeg(uploadPath, logger)
+			if err == nil {
+				if !isLocal {
+					os.Remove(uploadPath)
 				}
 				uploadPath = compressedPath
 				defer os.Remove(compressedPath)
@@ -165,7 +183,7 @@ func (h *Handler) UploadHandler(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		if err := h.storage.UploadFileToS3(uploadPath, filename, logger); err != nil {
+		if err := h.storage.UploadFileToS3(uploadPath, uploadFilename, logger); err != nil {
 			logger.WithError(err).Error("Failed to upload to S3")
 		}
 

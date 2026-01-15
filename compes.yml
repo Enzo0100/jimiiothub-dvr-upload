@@ -1,7 +1,7 @@
   dvr-upload:
     restart: always
     container_name: dvr-upload
-    image: enzo0001/dvr-upload:v2.0.1
+    image: enzo0001/dvr-upload:v2.0.5
     ports:
       - "23010:23010"
     volumes:
@@ -23,3 +23,4 @@
       - OCI_BUCKET_MEDIA=yuv-dvr-upload
       - OCI_ENDPOINT=https://grxwzzpo0ewx.compat.objectstorage.sa-saopaulo-1.oraclecloud.com
       - OCI_USE_PATH_STYLE_ENDPOINT=true
+      - ENABLE_TS_TO_MP4=true
