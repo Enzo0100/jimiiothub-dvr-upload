@@ -1,0 +1,184 @@
+package handlers
+
+import (
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"dvr-upload/config"
+	"dvr-upload/processor"
+	"dvr-upload/storage"
+	"dvr-upload/utils"
+
+	"github.com/google/uuid"
+	"github.com/sirupsen/logrus"
+)
+
+type Handler struct {
+	cfg     *config.Config
+	storage *storage.StorageService
+	log     *logrus.Logger
+}
+
+func NewHandler(cfg *config.Config, storage *storage.StorageService, log *logrus.Logger) *Handler {
+	return &Handler{
+		cfg:     cfg,
+		storage: storage,
+		log:     log,
+	}
+}
+
+func (h *Handler) PingHandler(w http.ResponseWriter, r *http.Request) {
+	utils.WriteJSON(w, http.StatusOK, utils.JSONResponse{Code: 200, Message: "ok"})
+}
+
+func (h *Handler) UploadHandler(w http.ResponseWriter, r *http.Request) {
+	requestID := uuid.New().String()
+	logger := h.log.WithFields(logrus.Fields{
+		"request_id":  requestID,
+		"remote_addr": r.RemoteAddr,
+		"method":      r.Method,
+		"uri":         r.RequestURI,
+	})
+
+	logger.Info("Upload request received")
+
+	if err := r.ParseMultipartForm(64 << 20); err != nil {
+		logger.WithError(err).Error("Failed to parse multipart form")
+		utils.WriteJSON(w, http.StatusBadRequest, utils.JSONResponse{Code: 400, Message: "Invalid form data"})
+		return
+	}
+
+	file, handler, err := r.FormFile("file")
+	if err != nil {
+		logger.WithError(err).Error("File is required in the form")
+		utils.WriteJSON(w, http.StatusBadRequest, utils.JSONResponse{Code: 400, Message: "File is required"})
+		return
+	}
+	defer file.Close()
+
+	fileSize := handler.Size
+	logger = logger.WithField("original_filesize", fileSize)
+
+	providedFilename := r.FormValue("filename")
+	timestamp := r.FormValue("timestamp")
+	sign := r.FormValue("sign")
+
+	builtName, buildErr := utils.BuildStandardFilename(r, handler)
+	finalFilename := strings.TrimSpace(providedFilename)
+	if finalFilename == "" {
+		if buildErr == nil && builtName != "" {
+			finalFilename = builtName
+		} else {
+			finalFilename = handler.Filename
+		}
+	}
+	finalFilename = filepath.Base(finalFilename)
+
+	reqLogger := logger.WithFields(logrus.Fields{
+		"original_filename": handler.Filename,
+		"final_filename":    finalFilename,
+		"provided_filename": providedFilename,
+		"timestamp":         timestamp,
+		"build_error":       buildErr,
+	})
+	reqLogger.Info("Processing file upload")
+
+	if len(finalFilename) > utils.MaxFilenameLength {
+		reqLogger.Error("Final filename exceeds max length")
+		utils.WriteJSON(w, http.StatusInternalServerError, utils.JSONResponse{Code: 500, Message: "File name too long"})
+		return
+	}
+
+	if h.cfg.EnableSecret {
+		baseForSign := providedFilename
+		if strings.TrimSpace(baseForSign) == "" {
+			baseForSign = finalFilename
+		}
+		expected := utils.GenerateSign(baseForSign, timestamp, h.cfg.SecretKey)
+		if sign != expected {
+			reqLogger.WithFields(logrus.Fields{
+				"received_sign": sign,
+				"expected_sign": expected,
+				"base_for_sign": baseForSign,
+			}).Warn("Invalid signature")
+			utils.WriteJSON(w, http.StatusBadRequest, utils.JSONResponse{Code: 400, Message: "Signature error"})
+			return
+		}
+		reqLogger.Info("Signature validated successfully")
+	}
+
+	var bytesWritten int64
+	var savedPath string
+	if !h.cfg.EnableLocalStorage {
+		savedPath = filepath.Join(os.TempDir(), finalFilename)
+	} else if h.cfg.DisasterRecoveryMode {
+		if h.cfg.BackupPath == "" {
+			reqLogger.Error("Disaster Recovery mode is ON but BACKUP_VIDEO_PATH is not set.")
+			utils.WriteJSON(w, http.StatusInternalServerError, utils.JSONResponse{Code: 500, Message: "Disaster recovery misconfigured"})
+			return
+		}
+		savedPath = filepath.Join(h.cfg.BackupPath, finalFilename)
+	} else {
+		savedPath = filepath.Join(h.cfg.VideoPath, finalFilename)
+	}
+
+	bytesWritten, err = h.storage.SaveUploadedFile(file, savedPath, reqLogger)
+	if err != nil {
+		utils.WriteJSON(w, http.StatusInternalServerError, utils.JSONResponse{Code: 500, Message: err.Error()})
+		return
+	}
+
+	if h.cfg.EnableLocalStorage {
+		if !h.cfg.DisasterRecoveryMode && h.cfg.BackupPath != "" {
+			go func(srcPath, dstFilename string, parentLogger *logrus.Entry) {
+				if err := h.storage.CopyToBackup(srcPath, dstFilename, parentLogger); err != nil {
+					parentLogger.WithError(err).Errorf("Failed to backup %s", dstFilename)
+				}
+			}(savedPath, finalFilename, reqLogger)
+		}
+		reqLogger.WithFields(logrus.Fields{
+			"path":          savedPath,
+			"bytes_written": bytesWritten,
+		}).Info("Upload success (local storage ON)")
+	} else {
+		reqLogger.WithFields(logrus.Fields{
+			"path":          savedPath,
+			"bytes_written": bytesWritten,
+		}).Info("Upload success (RAM/Temp storage)")
+	}
+
+	go func(path string, filename string, logger *logrus.Entry, isLocal bool) {
+		uploadPath := path
+		ext := strings.ToLower(filepath.Ext(filename))
+		if ext == ".mp4" || ext == ".ts" {
+			compressedPath, err := processor.CompressWithFFmpeg(path, logger)
+			if err == nil {
+				if !isLocal {
+					os.Remove(path)
+				}
+				uploadPath = compressedPath
+				defer os.Remove(compressedPath)
+			} else {
+				logger.WithError(err).Warn("Compression failed, will attempt to upload original")
+			}
+		}
+
+		if err := h.storage.UploadFileToS3(uploadPath, filename, logger); err != nil {
+			logger.WithError(err).Error("Failed to upload to S3")
+		}
+
+		if !isLocal {
+			if _, err := os.Stat(uploadPath); err == nil {
+				os.Remove(uploadPath)
+			}
+		}
+	}(savedPath, finalFilename, reqLogger, h.cfg.EnableLocalStorage)
+
+	if fileSize != bytesWritten {
+		reqLogger.Warnf("File size mismatch. Original: %d, Written: %d. Possible incomplete upload.", fileSize, bytesWritten)
+	}
+
+	utils.WriteJSON(w, http.StatusOK, utils.JSONResponse{Code: 200, Message: "File upload success", Data: finalFilename})
+}
