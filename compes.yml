@@ -1,7 +1,7 @@
   dvr-upload:
     restart: always
     container_name: dvr-upload
-    image: enzo0001/dvr-upload:v1.0.1
+    image: enzo0001/dvr-upload:v2.0.1
     ports:
       - "23010:23010"
     volumes:
@@ -14,4 +14,12 @@
       - SECRET_KEY=jimidvr@123!443
       - LOCAL_VIDEO_PATH=/data/upload
       - BACKUP_VIDEO_PATH=/data/backup
-      - DISASTER_RECOVERY_MODE=true
+      - DISASTER_RECOVERY_MODE=false
+      - ENABLE_LOCAL_STORAGE=true
+      - OCI_ACCESS_KEY_ID=1ddf187dd6b081c65ec45fa6a326cfd6a4a3b5b1
+      - OCI_SECRET_ACCESS_KEY=EoISOPvEtCNwpJXnuojWmKwFDh7gYddkiNeqFLWdg+s=
+      - OCI_REGION=sa-saopaulo-1
+      - OCI_NAMESPACE=grxwzzpo0ewx
+      - OCI_BUCKET_MEDIA=yuv-dvr-upload
+      - OCI_ENDPOINT=https://grxwzzpo0ewx.compat.objectstorage.sa-saopaulo-1.oraclecloud.com
+      - OCI_USE_PATH_STYLE_ENDPOINT=true

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/md5"
 	"encoding/base64"
 	"encoding/json"
@@ -9,13 +10,19 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/google/uuid"
 	"github.com/sirupsen/logrus"
 )
@@ -35,8 +42,63 @@ var (
 	videoPath            = getEnv("LOCAL_VIDEO_PATH", "/data/upload")
 	backupPath           = getEnv("BACKUP_VIDEO_PATH", "/data/dvr-upload-backup")
 	disasterRecoveryMode = getEnv("DISASTER_RECOVERY_MODE", "false") == "true"
+	enableLocalStorage   = getEnv("ENABLE_LOCAL_STORAGE", "true") == "true"
 	logFilePath          = "/app/dvr-upload/logs/server.log"
+
+	// S3 Configuration (OCI Compatibility)
+	s3Bucket    = getEnv("OCI_BUCKET_MEDIA", "")
+	s3Region    = getEnv("OCI_REGION", "sa-saopaulo-1")
+	s3Endpoint  = getEnv("OCI_ENDPOINT", "")
+	s3AccessKey = getEnv("OCI_ACCESS_KEY_ID", "")
+	s3SecretKey = getEnv("OCI_SECRET_ACCESS_KEY", "")
 )
+
+var s3Client *s3.Client
+
+func initS3() {
+	if s3Bucket == "" {
+		log.Warn("OCI_BUCKET_MEDIA not set, upload to object storage will be disabled")
+		return
+	}
+	if s3Endpoint == "" {
+		log.Warn("OCI_ENDPOINT not set, upload to object storage will be disabled")
+		return
+	}
+
+	if _, err := url.Parse(s3Endpoint); err != nil {
+		log.WithError(err).Error("Invalid OCI_ENDPOINT URL")
+		return
+	}
+
+	usePathStyle := strings.EqualFold(getEnv("OCI_USE_PATH_STYLE_ENDPOINT", "true"), "true")
+
+	cfg, err := config.LoadDefaultConfig(
+		context.TODO(),
+		config.WithRegion(s3Region),
+		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(s3AccessKey, s3SecretKey, "")),
+	)
+	if err != nil {
+		log.WithError(err).Error("Failed to load AWS config for S3-compatible endpoint")
+		return
+	}
+
+	// OCI Object Storage (S3 compat) não suporta o modo "aws-chunked" (trailing checksum).
+	// Forçamos o SDK a calcular checksum apenas quando requerido pela operação.
+	s3Client = s3.NewFromConfig(cfg, func(o *s3.Options) {
+		o.BaseEndpoint = aws.String(s3Endpoint)
+		o.UsePathStyle = usePathStyle
+		o.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
+		o.ResponseChecksumValidation = aws.ResponseChecksumValidationWhenRequired
+	})
+
+	log.WithFields(logrus.Fields{
+		"bucket":        s3Bucket,
+		"endpoint":      s3Endpoint,
+		"region":        s3Region,
+		"usePathStyle":  usePathStyle,
+		"checksum_mode": "when_required",
+	}).Info("S3-compatible client (AWS SDK v2 / OCI) initialized")
+}
 
 func main() {
 	// setup logging
@@ -59,6 +121,7 @@ func main() {
 	}).Info("[UploadServer] Starting server")
 
 	os.MkdirAll(videoPath, 0755)
+	initS3()
 
 	http.HandleFunc("/upload", uploadHandler)
 	http.HandleFunc("/ping", pingHandler)
@@ -149,47 +212,80 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var bytesWritten int64
-	if disasterRecoveryMode {
+	var savedPath string
+	if !enableLocalStorage {
+		// Se armazenamento local estiver desativado, usamos a pasta temporária do sistema (/tmp)
+		// que geralmente é mapeada em memória (RAM Disk - tmpfs) em Linux para performance máxima.
+		savedPath = filepath.Join(os.TempDir(), finalFilename)
+	} else if disasterRecoveryMode {
 		// Modo de recuperação de desastres: salvar diretamente no backup
 		if backupPath == "" {
 			reqLogger.Error("Disaster Recovery mode is ON but BACKUP_VIDEO_PATH is not set.")
 			writeJSON(w, http.StatusInternalServerError, JSONResponse{Code: 500, Message: "Disaster recovery misconfigured"})
 			return
 		}
-		backupDestPath := filepath.Join(backupPath, finalFilename)
-		bytesWritten, err = saveUploadedFile(file, backupDestPath, reqLogger)
-		if err != nil {
-			// Error is already logged in saveUploadedFile
-			writeJSON(w, http.StatusInternalServerError, JSONResponse{Code: 500, Message: err.Error()})
-			return
-		}
-		reqLogger.WithFields(logrus.Fields{
-			"path":          backupDestPath,
-			"bytes_written": bytesWritten,
-		}).Info("Upload success (DR mode)")
+		savedPath = filepath.Join(backupPath, finalFilename)
 	} else {
-		// Modo normal: salvar no caminho principal e depois copiar para o backup
-		dstPath := filepath.Join(videoPath, finalFilename)
-		bytesWritten, err = saveUploadedFile(file, dstPath, reqLogger)
-		if err != nil {
-			// Error is already logged in saveUploadedFile
-			writeJSON(w, http.StatusInternalServerError, JSONResponse{Code: 500, Message: err.Error()})
-			return
-		}
+		// Modo normal: salvar no caminho principal
+		savedPath = filepath.Join(videoPath, finalFilename)
+	}
 
-		// Se o backup estiver habilitado, copie o arquivo em segundo plano
-		if backupPath != "" {
+	bytesWritten, err = saveUploadedFile(file, savedPath, reqLogger)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, JSONResponse{Code: 500, Message: err.Error()})
+		return
+	}
+
+	if enableLocalStorage {
+		// Se estiver no modo normal (sem ser temporário), verificamos se precisa de backup
+		if !disasterRecoveryMode && backupPath != "" {
 			go func(srcPath, dstFilename string, parentLogger *logrus.Entry) {
 				if err := copyToBackup(srcPath, dstFilename, parentLogger); err != nil {
 					parentLogger.WithError(err).Errorf("Failed to backup %s", dstFilename)
 				}
-			}(dstPath, finalFilename, reqLogger)
+			}(savedPath, finalFilename, reqLogger)
 		}
 		reqLogger.WithFields(logrus.Fields{
-			"path":          dstPath,
+			"path":          savedPath,
 			"bytes_written": bytesWritten,
-		}).Info("Upload success")
+		}).Info("Upload success (local storage ON)")
+	} else {
+		reqLogger.WithFields(logrus.Fields{
+			"path":          savedPath,
+			"bytes_written": bytesWritten,
+		}).Info("Upload success (RAM/Temp storage)")
 	}
+
+	// Compress and upload to S3 in background
+	go func(path string, filename string, logger *logrus.Entry, isLocal bool) {
+		uploadPath := path
+		ext := strings.ToLower(filepath.Ext(filename))
+		// Check if it's a video for compression
+		if ext == ".mp4" || ext == ".ts" {
+			compressedPath, err := compressWithFFmpeg(path, logger)
+			if err == nil {
+				// Se a compressão teve sucesso e local storage está off, removemos o original imediatamente
+				if !isLocal {
+					os.Remove(path)
+				}
+				uploadPath = compressedPath
+				defer os.Remove(compressedPath)
+			} else {
+				logger.WithError(err).Warn("Compression failed, will attempt to upload original")
+			}
+		}
+
+		if err := uploadFileToS3(uploadPath, filename, logger); err != nil {
+			logger.WithError(err).Error("Failed to upload to S3")
+		}
+
+		// Se o armazenamento local estiver desativado, removemos o arquivo (original ou o que sobrou)
+		if !isLocal {
+			if _, err := os.Stat(uploadPath); err == nil {
+				os.Remove(uploadPath)
+			}
+		}
+	}(savedPath, finalFilename, reqLogger, enableLocalStorage)
 
 	if fileSize != bytesWritten {
 		reqLogger.Warnf("File size mismatch. Original: %d, Written: %d. Possible incomplete upload.", fileSize, bytesWritten)
@@ -405,4 +501,75 @@ func leftPad(s string, width int) string {
 		return s
 	}
 	return strings.Repeat("0", width-len(s)) + s
+}
+
+func compressWithFFmpeg(inputPath string, logger *logrus.Entry) (string, error) {
+	outputPath := inputPath + "_compressed.mp4"
+	logger.WithFields(logrus.Fields{
+		"input":  inputPath,
+		"output": outputPath,
+	}).Info("Starting ffmpeg compression (lossless)")
+
+	// -c:v libx264 -crf 0 is lossless for H.264
+	// -preset ultrafast para performance máxima (menor uso de CPU)
+	cmd := exec.Command("ffmpeg", "-i", inputPath, "-c:v", "libx264", "-crf", "0", "-preset", "ultrafast", "-y", outputPath)
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		logger.WithError(err).WithField("ffmpeg_output", string(output)).Error("FFmpeg compression failed")
+		return "", err
+	}
+
+	logger.Info("FFmpeg compression completed successfully")
+	return outputPath, nil
+}
+
+func uploadFileToS3(filePath string, filename string, logger *logrus.Entry) error {
+	if s3Client == nil || s3Bucket == "" {
+		logger.Warn("S3 upload skipped: client not initialized or bucket not set")
+		return nil
+	}
+
+	f, err := os.Open(filePath)
+	if err != nil {
+		return fmt.Errorf("failed to open file: %w", err)
+	}
+	defer f.Close()
+
+	stat, err := f.Stat()
+	if err != nil {
+		return fmt.Errorf("failed to stat file: %w", err)
+	}
+
+	contentType := "application/octet-stream"
+	switch strings.ToLower(filepath.Ext(filename)) {
+	case ".mp4":
+		contentType = "video/mp4"
+	case ".ts":
+		contentType = "video/MP2T"
+	case ".jpg", ".jpeg":
+		contentType = "image/jpeg"
+	}
+
+	logger.WithFields(logrus.Fields{
+		"bucket":       s3Bucket,
+		"key":          filename,
+		"filepath":     filePath,
+		"size":         stat.Size(),
+		"content_type": contentType,
+	}).Info("Uploading file to S3 (AWS SDK v2 / OCI)")
+
+	_, err = s3Client.PutObject(context.TODO(), &s3.PutObjectInput{
+		Bucket:        aws.String(s3Bucket),
+		Key:           aws.String(filename),
+		Body:          f,
+		ContentLength: aws.Int64(stat.Size()),
+		ContentType:   aws.String(contentType),
+	})
+	if err != nil {
+		return fmt.Errorf("failed to upload to S3-compatible storage: %w", err)
+	}
+
+	logger.Info("S3-compatible upload successful")
+	return nil
 }
