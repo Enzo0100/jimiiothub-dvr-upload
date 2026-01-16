@@ -1,7 +1,7 @@
   dvr-upload:
     restart: always
     container_name: dvr-upload
-    image: enzo0001/dvr-upload:v2.0.5
+    image: enzo0001/dvr-upload:2.0.7
     ports:
       - "23010:23010"
     volumes:
@@ -24,3 +24,9 @@
       - OCI_ENDPOINT=https://grxwzzpo0ewx.compat.objectstorage.sa-saopaulo-1.oraclecloud.com
       - OCI_USE_PATH_STYLE_ENDPOINT=true
       - ENABLE_TS_TO_MP4=true
+      - RABBITMQ_HOST=10.0.2.206
+      - RABBITMQ_PORT=5672
+      - RABBITMQ_USER=admin
+      - RABBITMQ_PASSWORD=sm4LreKYZfI3
+      - RABBITMQ_EXCHANGE=iothub-media
+      - RABBITMQ_QUEUE=iothub-media

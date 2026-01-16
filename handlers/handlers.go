@@ -5,9 +5,11 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 
 	"dvr-upload/config"
 	"dvr-upload/processor"
+	"dvr-upload/queue"
 	"dvr-upload/storage"
 	"dvr-upload/utils"
 
@@ -16,21 +18,31 @@ import (
 )
 
 type Handler struct {
-	cfg     *config.Config
-	storage *storage.StorageService
-	log     *logrus.Logger
+	cfg        *config.Config
+	storage    *storage.StorageService
+	rabbitMQ   *queue.RabbitMQClient
+	log        *logrus.Logger
+	mediaCount int64
 }
 
-func NewHandler(cfg *config.Config, storage *storage.StorageService, log *logrus.Logger) *Handler {
+func NewHandler(cfg *config.Config, storage *storage.StorageService, rabbitMQ *queue.RabbitMQClient, log *logrus.Logger) *Handler {
 	return &Handler{
-		cfg:     cfg,
-		storage: storage,
-		log:     log,
+		cfg:      cfg,
+		storage:  storage,
+		rabbitMQ: rabbitMQ,
+		log:      log,
 	}
 }
 
-func (h *Handler) PingHandler(w http.ResponseWriter, r *http.Request) {
-	utils.WriteJSON(w, http.StatusOK, utils.JSONResponse{Code: 200, Message: "ok"})
+func (h *Handler) HealthHandler(w http.ResponseWriter, r *http.Request) {
+	count := atomic.LoadInt64(&h.mediaCount)
+	utils.WriteJSON(w, http.StatusOK, utils.JSONResponse{
+		Code:    200,
+		Message: "ok",
+		Data: map[string]interface{}{
+			"media_processed_count": count,
+		},
+	})
 }
 
 func (h *Handler) UploadHandler(w http.ResponseWriter, r *http.Request) {
@@ -196,6 +208,19 @@ func (h *Handler) UploadHandler(w http.ResponseWriter, r *http.Request) {
 
 	if fileSize != bytesWritten {
 		reqLogger.Warnf("File size mismatch. Original: %d, Written: %d. Possible incomplete upload.", fileSize, bytesWritten)
+	}
+
+	atomic.AddInt64(&h.mediaCount, 1)
+
+	if h.rabbitMQ != nil {
+		err := h.rabbitMQ.PublishEvent(queue.UploadEvent{
+			Filename: finalFilename,
+			Size:     bytesWritten,
+			Path:     savedPath,
+		})
+		if err != nil {
+			reqLogger.WithError(err).Error("Failed to publish event to RabbitMQ")
+		}
 	}
 
 	utils.WriteJSON(w, http.StatusOK, utils.JSONResponse{Code: 200, Message: "File upload success", Data: finalFilename})

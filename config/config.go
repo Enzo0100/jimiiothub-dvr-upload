@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"strings"
 )
@@ -22,9 +23,22 @@ type Config struct {
 	S3AccessKey    string
 	S3SecretKey    string
 	S3UsePathStyle bool
+
+	// RabbitMQ Configuration
+	RabbitMQURL      string
+	RabbitMQQueue    string
+	RabbitMQExchange string
 }
 
 func LoadConfig() *Config {
+	// Construct RabbitMQ URL from individual components
+	rmqHost := getEnv("RABBITMQ_HOST", "localhost")
+	rmqPort := getEnv("RABBITMQ_PORT", "5672")
+	rmqUser := getEnv("RABBITMQ_USER", "guest")
+	rmqPass := getEnv("RABBITMQ_PASSWORD", "guest")
+
+	rmqURL := fmt.Sprintf("amqp://%s:%s@%s:%s/", rmqUser, rmqPass, rmqHost, rmqPort)
+
 	return &Config{
 		SecretKey:            getEnv("SECRET_KEY", "jimidvr@123!443"),
 		EnableSecret:         getEnv("ENABLE_SECRET", "true") == "true",
@@ -41,6 +55,10 @@ func LoadConfig() *Config {
 		S3AccessKey:    getEnv("OCI_ACCESS_KEY_ID", ""),
 		S3SecretKey:    getEnv("OCI_SECRET_ACCESS_KEY", ""),
 		S3UsePathStyle: strings.EqualFold(getEnv("OCI_USE_PATH_STYLE_ENDPOINT", "true"), "true"),
+
+		RabbitMQURL:      rmqURL,
+		RabbitMQQueue:    getEnv("RABBITMQ_QUEUE", "dvr_upload_events"),
+		RabbitMQExchange: getEnv("RABBITMQ_EXCHANGE", "iothub-webhook"),
 	}
 }
 

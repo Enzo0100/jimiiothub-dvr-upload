@@ -8,6 +8,7 @@ import (
 
 	"dvr-upload/config"
 	"dvr-upload/handlers"
+	"dvr-upload/queue"
 	"dvr-upload/storage"
 
 	"github.com/sirupsen/logrus"
@@ -44,9 +45,17 @@ func main() {
 	}
 
 	storageService := storage.NewStorageService(cfg, log)
-	h := handlers.NewHandler(cfg, storageService, log)
+
+	rabbitMQ, err := queue.NewRabbitMQClient(cfg.RabbitMQURL, cfg.RabbitMQQueue, cfg.RabbitMQExchange, log)
+	if err != nil {
+		log.WithError(err).Warn("Failed to initialize RabbitMQ client")
+	} else {
+		defer rabbitMQ.Close()
+	}
+
+	h := handlers.NewHandler(cfg, storageService, rabbitMQ, log)
 
 	http.HandleFunc("/upload", h.UploadHandler)
-	http.HandleFunc("/ping", h.PingHandler)
+	http.HandleFunc("/health", h.HealthHandler)
 	log.Fatal(http.ListenAndServe(":23010", nil))
 }
