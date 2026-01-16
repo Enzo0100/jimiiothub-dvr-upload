@@ -142,14 +142,11 @@ func (h *Handler) UploadHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if fileSize != bytesWritten {
+		reqLogger.Warnf("File size mismatch. Original: %d, Written: %d. Possible incomplete upload.", fileSize, bytesWritten)
+	}
+
 	if h.cfg.EnableLocalStorage {
-		if !h.cfg.DisasterRecoveryMode && h.cfg.BackupPath != "" {
-			go func(srcPath, dstFilename string, parentLogger *logrus.Entry) {
-				if err := h.storage.CopyToBackup(srcPath, dstFilename, parentLogger); err != nil {
-					parentLogger.WithError(err).Errorf("Failed to backup %s", dstFilename)
-				}
-			}(savedPath, finalFilename, reqLogger)
-		}
 		reqLogger.WithFields(logrus.Fields{
 			"path":          savedPath,
 			"bytes_written": bytesWritten,
@@ -170,12 +167,11 @@ func (h *Handler) UploadHandler(w http.ResponseWriter, r *http.Request) {
 		if ext == ".ts" && h.cfg.EnableTsToMp4 {
 			convertedPath, err := processor.ConvertTSToMP4(path, logger)
 			if err == nil {
-				if !isLocal {
-					os.Remove(path)
-				}
+				// Remove o arquivo original .ts se a conversão funcionou
+				os.Remove(path)
 				uploadPath = convertedPath
 				uploadFilename = strings.TrimSuffix(filename, ext) + ".mp4"
-				defer os.Remove(convertedPath)
+				ext = ".mp4" // Atualiza extensão para o próximo passo (compressão)
 			} else {
 				logger.WithError(err).Warn("TS->MP4 conversion failed, will attempt to upload original")
 			}
@@ -185,11 +181,15 @@ func (h *Handler) UploadHandler(w http.ResponseWriter, r *http.Request) {
 		if ext == ".mp4" {
 			compressedPath, err := processor.CompressWithFFmpeg(uploadPath, logger)
 			if err == nil {
-				if !isLocal {
-					os.Remove(uploadPath)
+				// Substitui o arquivo original pelo comprimido mantendo o nome original
+				originalPath := uploadPath
+				if errRename := os.Rename(compressedPath, originalPath); errRename == nil {
+					uploadPath = originalPath
+				} else {
+					// Fallback: se o rename falhar (ex: cross-device), remove original e usa novo
+					os.Remove(originalPath)
+					uploadPath = compressedPath
 				}
-				uploadPath = compressedPath
-				defer os.Remove(compressedPath)
 			} else {
 				logger.WithError(err).Warn("Compression failed, will attempt to upload original")
 			}
@@ -199,29 +199,31 @@ func (h *Handler) UploadHandler(w http.ResponseWriter, r *http.Request) {
 			logger.WithError(err).Error("Failed to upload to S3")
 		}
 
+		// Se o armazenamento local estiver desativado, removemos o arquivo final após o upload
 		if !isLocal {
 			if _, err := os.Stat(uploadPath); err == nil {
 				os.Remove(uploadPath)
 			}
 		}
-	}(savedPath, finalFilename, reqLogger, h.cfg.EnableLocalStorage)
 
-	if fileSize != bytesWritten {
-		reqLogger.Warnf("File size mismatch. Original: %d, Written: %d. Possible incomplete upload.", fileSize, bytesWritten)
-	}
+		// Incrementa contador e dispara evento RabbitMQ após processamento
+		atomic.AddInt64(&h.mediaCount, 1)
 
-	atomic.AddInt64(&h.mediaCount, 1)
-
-	if h.rabbitMQ != nil {
-		err := h.rabbitMQ.PublishEvent(queue.UploadEvent{
-			Filename: finalFilename,
-			Size:     bytesWritten,
-			Path:     savedPath,
-		})
-		if err != nil {
-			reqLogger.WithError(err).Error("Failed to publish event to RabbitMQ")
+		if h.rabbitMQ != nil {
+			finalSize := int64(0)
+			if stat, err := os.Stat(uploadPath); err == nil {
+				finalSize = stat.Size()
+			}
+			err := h.rabbitMQ.PublishEvent(queue.UploadEvent{
+				Filename: uploadFilename,
+				Size:     finalSize,
+				Path:     uploadPath,
+			})
+			if err != nil {
+				logger.WithError(err).Error("Failed to publish event to RabbitMQ after processing")
+			}
 		}
-	}
+	}(savedPath, finalFilename, reqLogger, h.cfg.EnableLocalStorage)
 
 	utils.WriteJSON(w, http.StatusOK, utils.JSONResponse{Code: 200, Message: "File upload success", Data: finalFilename})
 }

@@ -9,7 +9,7 @@ import (
 )
 
 func CompressWithFFmpeg(inputPath string, logger *logrus.Entry) (string, error) {
-	outputPath := inputPath + "_compressed.mp4"
+	outputPath := inputPath + ".tmp_compressed"
 	logger.WithFields(logrus.Fields{
 		"input":  inputPath,
 		"output": outputPath,

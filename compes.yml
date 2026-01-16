@@ -1,7 +1,7 @@
   dvr-upload:
     restart: always
     container_name: dvr-upload
-    image: enzo0001/dvr-upload:2.0.7
+    image: enzo0001/dvr-upload:v2.0.8
     ports:
       - "23010:23010"
     volumes:
