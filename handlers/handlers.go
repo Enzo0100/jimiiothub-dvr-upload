@@ -136,7 +136,9 @@ func (h *Handler) UploadHandler(w http.ResponseWriter, r *http.Request) {
 		savedPath = filepath.Join(h.cfg.VideoPath, finalFilename)
 	}
 
-	bytesWritten, err = h.storage.SaveUploadedFile(file, savedPath, reqLogger)
+	// Usa um caminho temporário único para evitar colisões durante o processamento concorrente
+	tempPath := savedPath + "." + requestID + ".tmp"
+	bytesWritten, err = h.storage.SaveUploadedFile(file, tempPath, reqLogger)
 	if err != nil {
 		utils.WriteJSON(w, http.StatusInternalServerError, utils.JSONResponse{Code: 500, Message: err.Error()})
 		return
@@ -148,17 +150,17 @@ func (h *Handler) UploadHandler(w http.ResponseWriter, r *http.Request) {
 
 	if h.cfg.EnableLocalStorage {
 		reqLogger.WithFields(logrus.Fields{
-			"path":          savedPath,
+			"temp_path":     tempPath,
 			"bytes_written": bytesWritten,
-		}).Info("Upload success (local storage ON)")
+		}).Info("Upload success (local storage ON - temporary file created)")
 	} else {
 		reqLogger.WithFields(logrus.Fields{
-			"path":          savedPath,
+			"temp_path":     tempPath,
 			"bytes_written": bytesWritten,
 		}).Info("Upload success (RAM/Temp storage)")
 	}
 
-	go func(path string, filename string, logger *logrus.Entry, isLocal bool) {
+	go func(path string, filename string, originalSavedPath string, logger *logrus.Entry, isLocal bool) {
 		uploadPath := path
 		uploadFilename := filename
 		ext := strings.ToLower(filepath.Ext(filename))
@@ -167,7 +169,7 @@ func (h *Handler) UploadHandler(w http.ResponseWriter, r *http.Request) {
 		if ext == ".ts" && h.cfg.EnableTsToMp4 {
 			convertedPath, err := processor.ConvertTSToMP4(path, logger)
 			if err == nil {
-				// Remove o arquivo original .ts se a conversão funcionou
+				// Remove o arquivo temporário original se a conversão funcionou
 				os.Remove(path)
 				uploadPath = convertedPath
 				uploadFilename = strings.TrimSuffix(filename, ext) + ".mp4"
@@ -181,15 +183,9 @@ func (h *Handler) UploadHandler(w http.ResponseWriter, r *http.Request) {
 		if ext == ".mp4" {
 			compressedPath, err := processor.CompressWithFFmpeg(uploadPath, logger)
 			if err == nil {
-				// Substitui o arquivo original pelo comprimido mantendo o nome original
-				originalPath := uploadPath
-				if errRename := os.Rename(compressedPath, originalPath); errRename == nil {
-					uploadPath = originalPath
-				} else {
-					// Fallback: se o rename falhar (ex: cross-device), remove original e usa novo
-					os.Remove(originalPath)
-					uploadPath = compressedPath
-				}
+				// Substitui o arquivo temporário pelo comprimido
+				os.Remove(uploadPath)
+				uploadPath = compressedPath
 			} else {
 				logger.WithError(err).Warn("Compression failed, will attempt to upload original")
 			}
@@ -197,33 +193,43 @@ func (h *Handler) UploadHandler(w http.ResponseWriter, r *http.Request) {
 
 		if err := h.storage.UploadFileToS3(uploadPath, uploadFilename, logger); err != nil {
 			logger.WithError(err).Error("Failed to upload to S3")
+			// Remove o arquivo temporário mesmo em caso de falha no S3
+			os.Remove(uploadPath)
+			return
 		}
 
-		// Se o armazenamento local estiver desativado, removemos o arquivo final após o upload
-		if !isLocal {
+		finalDestPath := uploadPath
+		if isLocal {
+			// Define o caminho final baseado no nome final do arquivo (pode ter mudado de .ts para .mp4)
+			finalDestPath = filepath.Join(filepath.Dir(originalSavedPath), uploadFilename)
+			if err := os.Rename(uploadPath, finalDestPath); err != nil {
+				logger.WithError(err).Warn("Failed to move temporary file to final destination, keeping temporary path")
+				finalDestPath = uploadPath
+			}
+		} else {
 			if _, err := os.Stat(uploadPath); err == nil {
 				os.Remove(uploadPath)
 			}
 		}
 
-		// Incrementa contador e dispara evento RabbitMQ após processamento
+		// Incrementa contador e dispara evento RabbitMQ apenas após sucesso no upload
 		atomic.AddInt64(&h.mediaCount, 1)
 
 		if h.rabbitMQ != nil {
 			finalSize := int64(0)
-			if stat, err := os.Stat(uploadPath); err == nil {
+			if stat, err := os.Stat(finalDestPath); err == nil {
 				finalSize = stat.Size()
 			}
 			err := h.rabbitMQ.PublishEvent(queue.UploadEvent{
 				Filename: uploadFilename,
 				Size:     finalSize,
-				Path:     uploadPath,
+				Path:     finalDestPath,
 			})
 			if err != nil {
 				logger.WithError(err).Error("Failed to publish event to RabbitMQ after processing")
 			}
 		}
-	}(savedPath, finalFilename, reqLogger, h.cfg.EnableLocalStorage)
+	}(tempPath, finalFilename, savedPath, reqLogger, h.cfg.EnableLocalStorage)
 
 	utils.WriteJSON(w, http.StatusOK, utils.JSONResponse{Code: 200, Message: "File upload success", Data: finalFilename})
 }
