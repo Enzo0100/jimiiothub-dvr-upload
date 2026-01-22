@@ -95,55 +95,147 @@ func (h *Handler) HealthHandler(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) TestPageHandler(w http.ResponseWriter, r *http.Request) {
 	html := `
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-    <title>DVR Upload Test</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DVR Upload Dashboard</title>
     <style>
-        body { font-family: sans-serif; max-width: 800px; margin: 20px auto; padding: 20px; line-height: 1.6; }
-        .card { border: 1px solid #ddd; padding: 15px; margin-bottom: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
-        h2 { margin-top: 0; color: #333; }
-        .form-group { margin-bottom: 10px; }
-        label { display: block; font-weight: bold; }
-        input[type="text"], input[type="file"] { width: 100%; padding: 8px; box-sizing: border-box; }
-        button { background: #007bff; color: white; border: none; padding: 10px 15px; border-radius: 4px; cursor: pointer; }
-        button:hover { background: #0056b3; }
-        pre { background: #f4f4f4; padding: 10px; border-radius: 4px; overflow-x: auto; }
+        :root {
+            --primary: #4f46e5;
+            --primary-hover: #4338ca;
+            --bg: #f8fafc;
+            --card-bg: #ffffff;
+            --text-main: #1e293b;
+            --text-muted: #64748b;
+            --border: #e2e8f0;
+            --success: #22c55e;
+        }
+        body { 
+            font-family: 'Inter', -apple-system, sans-serif; 
+            background-color: var(--bg);
+            color: var(--text-main);
+            max-width: 900px; 
+            margin: 0 auto; 
+            padding: 40px 20px; 
+            line-height: 1.5; 
+        }
+        .header { text-align: center; margin-bottom: 40px; }
+        .header h1 { margin: 0; font-size: 2.25rem; color: var(--text-main); font-weight: 800; letter-spacing: -0.025em; }
+        .header p { color: var(--text-muted); margin-top: 8px; }
+
+        .grid { display: grid; grid-template-columns: 1fr; gap: 24px; }
+        @media (min-width: 768px) { .grid { grid-template-columns: 3fr 2fr; } }
+
+        .card { 
+            background: var(--card-bg); 
+            border: 1px solid var(--border);
+            padding: 24px; 
+            border-radius: 12px; 
+            box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1); 
+        }
+        h2 { margin-top: 0; font-size: 1.25rem; font-weight: 600; display: flex; align-items: center; gap: 8px; }
+        
+        .form-group { margin-bottom: 20px; }
+        label { display: block; font-size: 0.875rem; font-weight: 500; margin-bottom: 6px; color: var(--text-main); }
+        
+        input[type="text"], input[type="file"] { 
+            width: 100%; 
+            padding: 10px 12px; 
+            border: 1px solid var(--border); 
+            border-radius: 6px;
+            font-size: 0.95rem;
+            transition: border-color 0.2s, box-shadow 0.2s;
+        }
+        input:focus {
+            outline: none;
+            border-color: var(--primary);
+            box-shadow: 0 0 0 3px rgba(79, 70, 229, 0.1);
+        }
+        
+        button { 
+            background: var(--primary); 
+            color: white; 
+            border: none; 
+            padding: 12px 20px; 
+            border-radius: 6px; 
+            font-weight: 600;
+            cursor: pointer; 
+            width: 100%;
+            transition: background 0.2s;
+        }
+        button:hover { background: var(--primary-hover); }
+        button.secondary { background: white; color: var(--text-main); border: 1px solid var(--border); margin-top: 12px; }
+        button.secondary:hover { background: #f1f5f9; }
+
+        pre { 
+            background: #1e293b; 
+            color: #e2e8f0;
+            padding: 16px; 
+            border-radius: 8px; 
+            font-size: 0.85rem;
+            overflow-x: auto;
+            margin-top: 16px;
+        }
+
+        .status-badge {
+            display: inline-flex;
+            align-items: center;
+            padding: 2px 8px;
+            border-radius: 99px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            background: #f1f5f9;
+        }
+        .status-ok { background: #dcfce7; color: #166534; }
     </style>
 </head>
 <body>
-    <h1>DVR Upload System - Test Page</h1>
-    
-    <div class="card">
-        <h2>Simulate Upload</h2>
-        <form action="/upload" method="post" enctype="multipart/form-data">
-            <div class="form-group">
-                <label>File (TS, MP4 or Images):</label>
-                <input type="file" name="file" required>
-            </div>
-            <div class="form-group">
-                <label>Filename (Optional):</label>
-                <input type="text" name="filename" placeholder="e.g. test_video.mp4">
-            </div>
-            <div class="form-group">
-                <label>Timestamp:</label>
-                <input type="text" name="timestamp" id="ts_field">
-            </div>
-            <div class="form-group">
-                <label>IMEI:</label>
-                <input type="text" name="imei" id="imei_field" value="864993060014264">
-            </div>
-            <div class="form-group" id="sign_group" style="display:none;">
-                <label>Auto-generated Signature:</label>
-                <input type="text" name="sign" id="sign_field" readonly style="background:#eee;">
-            </div>
-            <button type="submit">Upload File</button>
-        </form>
+    <div class="header">
+        <h1>DVR Upload System</h1>
+        <p>Developer Testing Dashboard - Version 2.0.22</p>
     </div>
+    
+    <div class="grid">
+        <div class="card">
+            <h2>📤 Simulate Upload</h2>
+            <form action="/upload" method="post" enctype="multipart/form-data">
+                <div class="form-group">
+                    <label>File (TS, MP4 or Images)</label>
+                    <input type="file" name="file" required>
+                </div>
+                <div class="form-group">
+                    <label>Filename (Override)</label>
+                    <input type="text" name="filename" placeholder="e.g. test_video.mp4">
+                    <small style="color:var(--text-muted); font-size:0.75rem">Leave empty to use original filename</small>
+                </div>
+                <div style="display:grid; grid-template-columns: 1fr 1fr; gap: 12px;">
+                    <div class="form-group">
+                        <label>Timestamp</label>
+                        <input type="text" name="timestamp" id="ts_field">
+                    </div>
+                    <div class="form-group">
+                        <label>IMEI</label>
+                        <input type="text" name="imei" id="imei_field" value="864993060014264">
+                    </div>
+                </div>
+                <div class="form-group" id="sign_group" style="display:none;">
+                    <label>Signature Token (Auto-generated)</label>
+                    <input type="text" name="sign" id="sign_field" readonly style="background:#f1f5f9; cursor:not-allowed;">
+                </div>
+                <button type="submit">Upload Now</button>
+            </form>
+        </div>
 
-    <div class="card">
-        <h2>System Status</h2>
-        <button onclick="checkHealth()">Check Health</button>
-        <pre id="health_result">Click to check health...</pre>
+        <div class="card">
+            <h2>🔍 System Health</h2>
+            <div id="health_summary" style="margin-bottom: 20px;">
+                <p style="font-size:0.9rem; margin: 5px 0;">S3 Storage: <span class="status-badge" id="s3_badge">pending...</span></p>
+                <p style="font-size:0.9rem; margin: 5px 0;">RabbitMQ: <span class="status-badge" id="rmq_badge">pending...</span></p>
+            </div>
+            <button class="secondary" onclick="checkHealth()">Refresh Health Status</button>
+            <pre id="health_result">Click refresh to load stats...</pre>
+        </div>
     </div>
 
     <script src="https://cdnjs.cloudflare.com/ajax/libs/crypto-js/4.1.1/crypto-js.min.js"></script>
@@ -155,8 +247,12 @@ func (h *Handler) TestPageHandler(w http.ResponseWriter, r *http.Request) {
             document.getElementById('sign_group').style.display = 'block';
         }
 
-        function generateSignature() {
+        function generateSignature(updateTimestamp = true) {
             if (!enableSecret) return;
+            
+            if (updateTimestamp) {
+                document.getElementById('ts_field').value = Date.now();
+            }
             
             const filenameInput = document.getElementsByName('filename')[0].value;
             const fileInput = document.getElementsByName('file')[0];
@@ -168,9 +264,7 @@ func (h *Handler) TestPageHandler(w http.ResponseWriter, r *http.Request) {
             }
 
             if (nameToSign) {
-                // MD5 em Hexadecimal
                 const hash = CryptoJS.MD5(nameToSign + timestamp + secretKey).toString();
-                // Base64 do Hexadecimal (conforme utils/crypto.go)
                 const base64Sign = btoa(hash);
                 document.getElementById('sign_field').value = base64Sign;
             }
@@ -178,16 +272,34 @@ func (h *Handler) TestPageHandler(w http.ResponseWriter, r *http.Request) {
 
         document.getElementById('ts_field').value = Date.now();
         
-        // Event listeners para atualizar assinatura
-        document.getElementsByName('filename')[0].addEventListener('input', generateSignature);
-        document.getElementsByName('file')[0].addEventListener('change', generateSignature);
-        document.getElementById('ts_field').addEventListener('input', generateSignature);
+        document.getElementsByName('filename')[0].addEventListener('input', () => generateSignature(true));
+        document.getElementsByName('file')[0].addEventListener('change', () => generateSignature(true));
+        document.getElementById('ts_field').addEventListener('input', () => generateSignature(false));
 
         async function checkHealth() {
-            const res = await fetch('/health');
-            const data = await res.json();
-            document.getElementById('health_result').innerText = JSON.stringify(data, null, 2);
+            try {
+                const res = await fetch('/health');
+                const data = await res.json();
+                document.getElementById('health_result').innerText = JSON.stringify(data, null, 2);
+                
+                const s3 = data.data.dependencies.s3_storage;
+                const rmq = data.data.dependencies.rabbitmq;
+                
+                const s3Badge = document.getElementById('s3_badge');
+                s3Badge.innerText = s3 === 'ok' ? 'Online' : 'Error';
+                s3Badge.className = 'status-badge ' + (s3 === 'ok' ? 'status-ok' : '');
+                
+                const rmqBadge = document.getElementById('rmq_badge');
+                rmqBadge.innerText = rmq === 'ok' ? 'Online' : (rmq === 'not_configured' ? 'N/A' : 'Error');
+                rmqBadge.className = 'status-badge ' + (rmq === 'ok' ? 'status-ok' : '');
+                
+            } catch (e) {
+                document.getElementById('health_result').innerText = "Failed to connect to /health";
+            }
         }
+
+        // Initial check
+        checkHealth();
     </script>
 </body>
 </html>
