@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"fmt"
 	"io"
 	"mime/multipart"
 	"net/http"
@@ -9,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"dvr-upload/config"
 	"dvr-upload/processor"
@@ -21,34 +23,77 @@ import (
 )
 
 type Handler struct {
-	cfg        *config.Config
-	storage    *storage.StorageService
-	rabbitMQ   *queue.RabbitMQClient
-	log        *logrus.Logger
-	mediaCount int64
+	cfg               *config.Config
+	storage           *storage.StorageService
+	rabbitMQ          *queue.RabbitMQClient
+	log               *logrus.Logger
+	mediaCount        int64
+	successfulUploads int64
+	failedUploads     int64
+	lastUploadTime    int64 // Unix timestamp
+	startTime         time.Time
 }
 
 func NewHandler(cfg *config.Config, storage *storage.StorageService, rabbitMQ *queue.RabbitMQClient, log *logrus.Logger) *Handler {
 	return &Handler{
-		cfg:      cfg,
-		storage:  storage,
-		rabbitMQ: rabbitMQ,
-		log:      log,
+		cfg:       cfg,
+		storage:   storage,
+		rabbitMQ:  rabbitMQ,
+		log:       log,
+		startTime: time.Now(),
 	}
 }
 
 func (h *Handler) HealthHandler(w http.ResponseWriter, r *http.Request) {
-	count := atomic.LoadInt64(&h.mediaCount)
-	utils.WriteJSON(w, http.StatusOK, utils.JSONResponse{
-		Code:    200,
-		Message: "ok",
+	mediaCount := atomic.LoadInt64(&h.mediaCount)
+	successCount := atomic.LoadInt64(&h.successfulUploads)
+	failCount := atomic.LoadInt64(&h.failedUploads)
+	lastTime := atomic.LoadInt64(&h.lastUploadTime)
+
+	s3Status := "ok"
+	if err := h.storage.Ping(); err != nil {
+		s3Status = fmt.Sprintf("error: %v", err)
+	}
+
+	rmqStatus := "ok"
+	if h.rabbitMQ != nil {
+		if err := h.rabbitMQ.Ping(); err != nil {
+			rmqStatus = fmt.Sprintf("error: %v", err)
+		}
+	} else {
+		rmqStatus = "not_configured"
+	}
+
+	lastProcessed := "never"
+	if lastTime > 0 {
+		lastProcessed = time.Unix(lastTime, 0).Format(time.RFC3339)
+	}
+
+	status := http.StatusOK
+	if s3Status != "ok" || (h.rabbitMQ != nil && rmqStatus != "ok") {
+		status = http.StatusServiceUnavailable
+	}
+
+	utils.WriteJSON(w, status, utils.JSONResponse{
+		Code:    status,
+		Message: "health check report",
 		Data: map[string]interface{}{
-			"media_processed_count": count,
+			"status":             "running",
+			"uptime":             time.Since(h.startTime).String(),
+			"media_total_count":  mediaCount,
+			"successful_uploads": successCount,
+			"failed_uploads":     failCount,
+			"last_processed_at":  lastProcessed,
+			"dependencies": map[string]string{
+				"s3_storage": s3Status,
+				"rabbitmq":   rmqStatus,
+			},
 		},
 	})
 }
 
 func (h *Handler) UploadHandler(w http.ResponseWriter, r *http.Request) {
+	startTime := time.Now()
 	requestID := uuid.New().String()
 	logger := h.log.WithFields(logrus.Fields{
 		"request_id":  requestID,
@@ -118,6 +163,7 @@ func (h *Handler) UploadHandler(w http.ResponseWriter, r *http.Request) {
 			streamedTempPath = tempFile.Name()
 
 			// Usar um buffer maior para io.Copy para melhorar performance de rede/disco
+			streamStart := time.Now()
 			buffer := make([]byte, 1<<20) // 1MB buffer
 			n, err := io.CopyBuffer(tempFile, part, buffer)
 			if err != nil {
@@ -129,7 +175,15 @@ func (h *Handler) UploadHandler(w http.ResponseWriter, r *http.Request) {
 			}
 			handlerSize = n
 			tempFile.Close() // Fecha o arquivo pois já terminou a escrita do stream
-			continue         // Já processamos o arquivo
+
+			duration := time.Since(streamStart)
+			speed := float64(n) / 1024 / 1024 / duration.Seconds()
+			logger.WithFields(logrus.Fields{
+				"size":      n,
+				"duration":  duration.String(),
+				"speed_mbs": fmt.Sprintf("%.2f MB/s", speed),
+			}).Info("File stream received and saved")
+			continue // Já processamos o arquivo
 		}
 
 		// Processar outros campos do formulário
@@ -283,13 +337,17 @@ func (h *Handler) UploadHandler(w http.ResponseWriter, r *http.Request) {
 		}).Info("Upload success (RAM/Temp storage)")
 	}
 
-	go func(path string, filename string, originalSavedPath string, logger *logrus.Entry, isLocal bool) {
+	go func(path string, filename string, originalSavedPath string, logger *logrus.Entry, isLocal bool, startTime time.Time) {
+		bgStart := time.Now()
 		uploadPath := path
 		uploadFilename := filename
 		ext := strings.ToLower(filepath.Ext(filename))
 
+		logger.WithField("bg_start_delay", bgStart.Sub(startTime).String()).Info("Background processing started")
+
 		// Conversão opcional TS -> MP4 antes do upload.
 		if ext == ".ts" && h.cfg.EnableTsToMp4 {
+			convStart := time.Now()
 			convertedPath, err := processor.ConvertTSToMP4(path, logger)
 			if err == nil {
 				// Remove o arquivo temporário original se a conversão funcionou
@@ -297,13 +355,17 @@ func (h *Handler) UploadHandler(w http.ResponseWriter, r *http.Request) {
 				uploadPath = convertedPath
 				uploadFilename = strings.TrimSuffix(filename, ext) + ".mp4"
 				ext = ".mp4" // Atualiza extensão para o próximo passo (compressão)
+				logger.WithField("duration", time.Since(convStart).String()).Info("TS->MP4 conversion background step done")
 			} else {
-				logger.WithError(err).Warn("TS->MP4 conversion failed, will attempt to upload original")
+				logger.WithError(err).Warn("TS->MP4 conversion failed, will attempt to upload original as TS")
+				// Se falhar a conversão, mantemos o arquivo original .ts para upload
 			}
 		}
 
 		// Mantém a compressão atual apenas para MP4 (se aplicável).
+		// Se o arquivo original era JPEG ou outro formato, ele pulará este bloco e irá direto para S3
 		if ext == ".mp4" {
+			compStart := time.Now()
 			compressedPath, err := processor.CompressWithFFmpeg(uploadPath, logger)
 			if err == nil {
 				// Comparar tamanhos: se o comprimido for maior que o original (comum com CRF 0 ou arquivos pequenos),
@@ -311,10 +373,24 @@ func (h *Handler) UploadHandler(w http.ResponseWriter, r *http.Request) {
 				origStat, _ := os.Stat(uploadPath)
 				compStat, _ := os.Stat(compressedPath)
 				if compStat.Size() < origStat.Size() {
+					preCompSize := origStat.Size()
+					compSize := compStat.Size()
 					os.Remove(uploadPath)
 					uploadPath = compressedPath
+
+					reduction := float64(preCompSize-compSize) / float64(preCompSize) * 100
+					globalReduction := float64(fileSize-compSize) / float64(fileSize) * 100
+
+					logger.WithFields(logrus.Fields{
+						"duration":             time.Since(compStart).String(),
+						"pre_compression_size": preCompSize,
+						"compressed_size":      compSize,
+						"step_reduction":       fmt.Sprintf("%.2f%%", reduction),
+						"global_reduction":     fmt.Sprintf("%.2f%%", globalReduction),
+					}).Info("Compression background step done (using compressed)")
 				} else {
 					logger.WithFields(logrus.Fields{
+						"duration":        time.Since(compStart).String(),
 						"original_size":   origStat.Size(),
 						"compressed_size": compStat.Size(),
 					}).Info("Compressed file is larger than original, keeping original")
@@ -325,20 +401,29 @@ func (h *Handler) UploadHandler(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
+		s3Start := time.Now()
 		if err := h.storage.UploadFileToS3(uploadPath, uploadFilename, logger); err != nil {
 			logger.WithError(err).Error("Failed to upload to S3")
+			atomic.AddInt64(&h.failedUploads, 1)
 			// Remove o arquivo temporário mesmo em caso de falha no S3
 			os.Remove(uploadPath)
 			return
 		}
+		logger.WithField("duration", time.Since(s3Start).String()).Info("S3 upload background step done")
+
+		atomic.AddInt64(&h.successfulUploads, 1)
+		atomic.StoreInt64(&h.lastUploadTime, time.Now().Unix())
 
 		finalDestPath := uploadPath
+		renameStart := time.Now()
 		if isLocal {
 			// Define o caminho final baseado no nome final do arquivo (pode ter mudado de .ts para .mp4)
 			finalDestPath = filepath.Join(filepath.Dir(originalSavedPath), uploadFilename)
 			if err := os.Rename(uploadPath, finalDestPath); err != nil {
 				logger.WithError(err).Warn("Failed to move temporary file to final destination, keeping temporary path")
 				finalDestPath = uploadPath
+			} else {
+				logger.WithField("duration", time.Since(renameStart).String()).Info("File moved to final local destination")
 			}
 		} else {
 			if _, err := os.Stat(uploadPath); err == nil {
@@ -354,6 +439,12 @@ func (h *Handler) UploadHandler(w http.ResponseWriter, r *http.Request) {
 			if stat, err := os.Stat(finalDestPath); err == nil {
 				finalSize = stat.Size()
 			}
+			logger.WithFields(logrus.Fields{
+				"final_filename": uploadFilename,
+				"final_size":     finalSize,
+				"exchange":       h.cfg.RabbitMQExchange,
+				"queue":          h.cfg.RabbitMQQueue,
+			}).Info("Publishing event to RabbitMQ")
 			err := h.rabbitMQ.PublishEvent(queue.UploadEvent{
 				Filename: uploadFilename,
 				Size:     finalSize,
@@ -363,7 +454,11 @@ func (h *Handler) UploadHandler(w http.ResponseWriter, r *http.Request) {
 				logger.WithError(err).Error("Failed to publish event to RabbitMQ after processing")
 			}
 		}
-	}(tempPath, finalFilename, savedPath, reqLogger, h.cfg.EnableLocalStorage)
+		logger.WithFields(logrus.Fields{
+			"total_duration": time.Since(startTime).String(),
+			"bg_duration":    time.Since(bgStart).String(),
+		}).Info("Background processing finished successfully")
+	}(tempPath, finalFilename, savedPath, reqLogger, h.cfg.EnableLocalStorage, startTime)
 
 	utils.WriteJSON(w, http.StatusOK, utils.JSONResponse{Code: 200, Message: "File upload success", Data: finalFilename})
 }

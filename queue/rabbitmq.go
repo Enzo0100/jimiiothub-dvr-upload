@@ -72,6 +72,16 @@ func (c *RabbitMQClient) Close() {
 	}
 }
 
+func (c *RabbitMQClient) Ping() error {
+	if c.conn == nil || c.conn.IsClosed() {
+		return fmt.Errorf("RabbitMQ connection closed")
+	}
+	if c.channel == nil || c.channel.IsClosed() {
+		return fmt.Errorf("RabbitMQ channel closed")
+	}
+	return nil
+}
+
 func (c *RabbitMQClient) PublishEvent(event UploadEvent) error {
 	body, err := json.Marshal(event)
 	if err != nil {

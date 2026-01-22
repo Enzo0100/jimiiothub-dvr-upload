@@ -4,11 +4,13 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/sirupsen/logrus"
 )
 
 func CompressWithFFmpeg(inputPath string, logger *logrus.Entry) (string, error) {
+	start := time.Now()
 	// Usar extensão .mp4 para que o ffmpeg consiga detectar o formato do muxer corretamente
 	outputPath := inputPath + ".compressed.mp4"
 	logger.WithFields(logrus.Fields{
@@ -21,17 +23,21 @@ func CompressWithFFmpeg(inputPath string, logger *logrus.Entry) (string, error) 
 
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		logger.WithError(err).WithField("ffmpeg_output", string(output)).Error("FFmpeg compression failed")
+		logger.WithError(err).WithFields(logrus.Fields{
+			"ffmpeg_output": string(output),
+			"duration":      time.Since(start).String(),
+		}).Error("FFmpeg compression failed")
 		return "", err
 	}
 
-	logger.Info("FFmpeg compression completed successfully")
+	logger.WithField("duration", time.Since(start).String()).Info("FFmpeg compression completed successfully")
 	return outputPath, nil
 }
 
 // ConvertTSToMP4 faz remux (rápido) de .ts para .mp4, sem re-encode quando possível.
 // Retorna o caminho do arquivo .mp4 gerado.
 func ConvertTSToMP4(inputPath string, logger *logrus.Entry) (string, error) {
+	start := time.Now()
 	base := strings.TrimSuffix(inputPath, filepath.Ext(inputPath))
 	outputPath := base + ".mp4"
 
@@ -52,7 +58,7 @@ func ConvertTSToMP4(inputPath string, logger *logrus.Entry) (string, error) {
 	)
 	output, err := cmd.CombinedOutput()
 	if err == nil {
-		logger.Info("FFmpeg TS->MP4 conversion completed successfully")
+		logger.WithField("duration", time.Since(start).String()).Info("FFmpeg TS->MP4 conversion completed successfully")
 		return outputPath, nil
 	}
 	logger.WithError(err).WithField("ffmpeg_output", string(output)).Warn("FFmpeg TS->MP4 remux failed, retrying with aac_adtstoasc")
@@ -70,10 +76,13 @@ func ConvertTSToMP4(inputPath string, logger *logrus.Entry) (string, error) {
 	)
 	output2, err2 := cmd2.CombinedOutput()
 	if err2 != nil {
-		logger.WithError(err2).WithField("ffmpeg_output", string(output2)).Error("FFmpeg TS->MP4 conversion failed")
+		logger.WithError(err2).WithFields(logrus.Fields{
+			"ffmpeg_output": string(output2),
+			"duration":      time.Since(start).String(),
+		}).Error("FFmpeg TS->MP4 conversion failed")
 		return "", err2
 	}
 
-	logger.Info("FFmpeg TS->MP4 conversion completed successfully")
+	logger.WithField("duration", time.Since(start).String()).Info("FFmpeg TS->MP4 conversion completed successfully")
 	return outputPath, nil
 }

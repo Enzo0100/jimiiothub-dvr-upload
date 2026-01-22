@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"dvr-upload/config"
 
@@ -63,6 +64,14 @@ func (s *StorageService) initS3() {
 		"usePathStyle":  s.cfg.S3UsePathStyle,
 		"checksum_mode": "when_required",
 	}).Info("S3-compatible client (AWS SDK v2 / OCI) initialized")
+}
+
+func (s *StorageService) Ping() error {
+	if s.s3Client == nil {
+		return fmt.Errorf("S3 client not initialized")
+	}
+	_, err := s.s3Client.ListBuckets(context.TODO(), &s3.ListBucketsInput{})
+	return err
 }
 
 func (s *StorageService) SaveUploadedFile(file multipart.File, dstPath string, logger *logrus.Entry) (int64, error) {
@@ -143,6 +152,7 @@ func (s *StorageService) UploadFileToS3(filePath string, filename string, logger
 		return nil
 	}
 
+	start := time.Now()
 	f, err := os.Open(filePath)
 	if err != nil {
 		return fmt.Errorf("failed to open file: %w", err)
@@ -153,6 +163,7 @@ func (s *StorageService) UploadFileToS3(filePath string, filename string, logger
 	if err != nil {
 		return fmt.Errorf("failed to stat file: %w", err)
 	}
+	fileSize := stat.Size()
 
 	contentType := "application/octet-stream"
 	switch strings.ToLower(filepath.Ext(filename)) {
@@ -168,7 +179,7 @@ func (s *StorageService) UploadFileToS3(filePath string, filename string, logger
 		"bucket":       s.cfg.S3Bucket,
 		"key":          filename,
 		"filepath":     filePath,
-		"size":         stat.Size(),
+		"size":         fileSize,
 		"content_type": contentType,
 	}).Info("Uploading file to S3 (AWS SDK v2 / OCI)")
 
@@ -176,13 +187,19 @@ func (s *StorageService) UploadFileToS3(filePath string, filename string, logger
 		Bucket:        aws.String(s.cfg.S3Bucket),
 		Key:           aws.String(filename),
 		Body:          f,
-		ContentLength: aws.Int64(stat.Size()),
+		ContentLength: aws.Int64(fileSize),
 		ContentType:   aws.String(contentType),
 	})
 	if err != nil {
-		return fmt.Errorf("failed to upload to S3-compatible storage: %w", err)
+		return fmt.Errorf("failed to upload to S3-compatible storage (duration: %s): %w", time.Since(start), err)
 	}
 
-	logger.Info("S3-compatible upload successful")
+	duration := time.Since(start)
+	speed := float64(fileSize) / 1024 / 1024 / duration.Seconds() // MB/s
+
+	logger.WithFields(logrus.Fields{
+		"duration":  duration.String(),
+		"speed_mbs": fmt.Sprintf("%.2f MB/s", speed),
+	}).Info("S3-compatible upload successful")
 	return nil
 }
