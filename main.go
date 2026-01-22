@@ -59,6 +59,7 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/upload", h.UploadHandler)
 	mux.HandleFunc("/health", h.HealthHandler)
+	mux.HandleFunc("/test", h.TestPageHandler)
 
 	srv := &http.Server{
 		Addr:              ":23010",

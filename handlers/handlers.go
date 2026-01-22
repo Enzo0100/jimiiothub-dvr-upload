@@ -92,6 +92,120 @@ func (h *Handler) HealthHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (h *Handler) TestPageHandler(w http.ResponseWriter, r *http.Request) {
+	html := `
+<!DOCTYPE html>
+<html>
+<head>
+    <title>DVR Upload Test</title>
+    <style>
+        body { font-family: sans-serif; max-width: 800px; margin: 20px auto; padding: 20px; line-height: 1.6; }
+        .card { border: 1px solid #ddd; padding: 15px; margin-bottom: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        h2 { margin-top: 0; color: #333; }
+        .form-group { margin-bottom: 10px; }
+        label { display: block; font-weight: bold; }
+        input[type="text"], input[type="file"] { width: 100%; padding: 8px; box-sizing: border-box; }
+        button { background: #007bff; color: white; border: none; padding: 10px 15px; border-radius: 4px; cursor: pointer; }
+        button:hover { background: #0056b3; }
+        pre { background: #f4f4f4; padding: 10px; border-radius: 4px; overflow-x: auto; }
+    </style>
+</head>
+<body>
+    <h1>DVR Upload System - Test Page</h1>
+    
+    <div class="card">
+        <h2>Simulate Upload</h2>
+        <form action="/upload" method="post" enctype="multipart/form-data">
+            <div class="form-group">
+                <label>File (TS, MP4 or Images):</label>
+                <input type="file" name="file" required>
+            </div>
+            <div class="form-group">
+                <label>Filename (Optional):</label>
+                <input type="text" name="filename" placeholder="e.g. test_video.mp4">
+            </div>
+            <div class="form-group">
+                <label>Timestamp:</label>
+                <input type="text" name="timestamp" id="ts_field">
+            </div>
+            <div class="form-group">
+                <label>IMEI:</label>
+                <input type="text" name="imei" id="imei_field" value="864993060014264">
+            </div>
+            <div class="form-group" id="sign_group" style="display:none;">
+                <label>Auto-generated Signature:</label>
+                <input type="text" name="sign" id="sign_field" readonly style="background:#eee;">
+            </div>
+            <button type="submit">Upload File</button>
+        </form>
+    </div>
+
+    <div class="card">
+        <h2>System Status</h2>
+        <button onclick="checkHealth()">Check Health</button>
+        <pre id="health_result">Click to check health...</pre>
+    </div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/crypto-js/4.1.1/crypto-js.min.js"></script>
+    <script>
+        const secretKey = "{{.SecretKey}}";
+        const enableSecret = {{.EnableSecret}};
+
+        if (enableSecret) {
+            document.getElementById('sign_group').style.display = 'block';
+        }
+
+        function generateSignature() {
+            if (!enableSecret) return;
+            
+            const filenameInput = document.getElementsByName('filename')[0].value;
+            const fileInput = document.getElementsByName('file')[0];
+            const timestamp = document.getElementById('ts_field').value;
+            
+            let nameToSign = filenameInput.trim();
+            if (!nameToSign && fileInput.files.length > 0) {
+                nameToSign = fileInput.files[0].name;
+            }
+
+            if (nameToSign) {
+                // MD5 em Hexadecimal
+                const hash = CryptoJS.MD5(nameToSign + timestamp + secretKey).toString();
+                // Base64 do Hexadecimal (conforme utils/crypto.go)
+                const base64Sign = btoa(hash);
+                document.getElementById('sign_field').value = base64Sign;
+            }
+        }
+
+        document.getElementById('ts_field').value = Date.now();
+        
+        // Event listeners para atualizar assinatura
+        document.getElementsByName('filename')[0].addEventListener('input', generateSignature);
+        document.getElementsByName('file')[0].addEventListener('change', generateSignature);
+        document.getElementById('ts_field').addEventListener('input', generateSignature);
+
+        async function checkHealth() {
+            const res = await fetch('/health');
+            const data = await res.json();
+            document.getElementById('health_result').innerText = JSON.stringify(data, null, 2);
+        }
+    </script>
+</body>
+</html>
+`
+	w.Header().Set("Content-Type", "text/html")
+	w.WriteHeader(http.StatusOK)
+
+	// Injetar variáveis do servidor no template HTML
+	tmpl := strings.ReplaceAll(html, "{{.SecretKey}}", h.cfg.SecretKey)
+	if h.cfg.EnableSecret {
+		tmpl = strings.ReplaceAll(tmpl, "{{.EnableSecret}}", "true")
+	} else {
+		tmpl = strings.ReplaceAll(tmpl, "{{.EnableSecret}}", "false")
+	}
+
+	w.Write([]byte(tmpl))
+}
+
 func (h *Handler) UploadHandler(w http.ResponseWriter, r *http.Request) {
 	startTime := time.Now()
 	requestID := uuid.New().String()
