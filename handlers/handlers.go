@@ -1,7 +1,10 @@
 package handlers
 
 import (
+	"io"
+	"mime/multipart"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -56,45 +59,154 @@ func (h *Handler) UploadHandler(w http.ResponseWriter, r *http.Request) {
 
 	logger.Info("Upload request received")
 
-	if err := r.ParseMultipartForm(64 << 20); err != nil {
-		logger.WithError(err).Error("Failed to parse multipart form")
-		utils.WriteJSON(w, http.StatusBadRequest, utils.JSONResponse{Code: 400, Message: "Invalid form data"})
+	// Usar MultipartReader para processamento mais eficiente de grandes volumes de dados (streaming)
+	reader, err := r.MultipartReader()
+	if err != nil {
+		logger.WithError(err).Error("Failed to create multipart reader")
+		utils.WriteJSON(w, http.StatusBadRequest, utils.JSONResponse{Code: 400, Message: "Expected multipart/form-data"})
 		return
 	}
 
-	file, handler, err := r.FormFile("file")
-	if err != nil {
-		logger.WithError(err).Error("File is required in the form")
+	var streamedTempPath string // Novo: guarda o path do arquivo já em disco
+	var handlerFilename string
+	var handlerSize int64
+	var providedFilename string
+	var timestamp string
+	var sign string
+	var imei string
+	var typ string
+	var channel string
+	var datetime string
+	var pattern string
+	var raw string
+	var index string
+
+	for {
+		part, err := reader.NextPart()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			logger.WithError(err).Error("Failed to read multipart part")
+			utils.WriteJSON(w, http.StatusInternalServerError, utils.JSONResponse{Code: 500, Message: "Error reading upload stream"})
+			return
+		}
+
+		formName := part.FormName()
+		if formName == "file" {
+			handlerFilename = part.FileName()
+			// Determinar diretório base para evitar cross-device links (Rename entre partitions falha)
+			tempDir := os.TempDir()
+			if h.cfg.EnableLocalStorage {
+				if h.cfg.DisasterRecoveryMode && h.cfg.BackupPath != "" {
+					tempDir = h.cfg.BackupPath
+				} else if h.cfg.VideoPath != "" {
+					tempDir = h.cfg.VideoPath
+				}
+			}
+			// Garante que o diretório escolhido existe ou faz fallback para temp do sistema
+			if _, err := os.Stat(tempDir); os.IsNotExist(err) && tempDir != os.TempDir() {
+				tempDir = os.TempDir()
+			}
+
+			tempFile, err := os.CreateTemp(tempDir, "upload-stream-*")
+			if err != nil {
+				logger.WithError(err).Error("Failed to create temporary file for streaming")
+				utils.WriteJSON(w, http.StatusInternalServerError, utils.JSONResponse{Code: 500, Message: "Internal server error"})
+				return
+			}
+			streamedTempPath = tempFile.Name()
+
+			// Usar um buffer maior para io.Copy para melhorar performance de rede/disco
+			buffer := make([]byte, 1<<20) // 1MB buffer
+			n, err := io.CopyBuffer(tempFile, part, buffer)
+			if err != nil {
+				tempFile.Close()
+				os.Remove(streamedTempPath)
+				logger.WithError(err).WithField("bytes_read", n).Error("Error saving file part stream")
+				utils.WriteJSON(w, http.StatusInternalServerError, utils.JSONResponse{Code: 500, Message: "Failed to receive file content"})
+				return
+			}
+			handlerSize = n
+			tempFile.Close() // Fecha o arquivo pois já terminou a escrita do stream
+			continue         // Já processamos o arquivo
+		}
+
+		// Processar outros campos do formulário
+		value, _ := io.ReadAll(part)
+		valStr := string(value)
+		switch formName {
+		case "filename":
+			providedFilename = valStr
+		case "timestamp":
+			timestamp = valStr
+		case "sign":
+			sign = valStr
+		case "imei":
+			imei = valStr
+		case "type":
+			typ = valStr
+		case "channel":
+			channel = valStr
+		case "datetime":
+			datetime = valStr
+		case "pattern":
+			pattern = valStr
+		case "raw":
+			raw = valStr
+		case "index":
+			index = valStr
+		}
+	}
+
+	if streamedTempPath == "" {
+		logger.Error("File is required in the form")
 		utils.WriteJSON(w, http.StatusBadRequest, utils.JSONResponse{Code: 400, Message: "File is required"})
 		return
 	}
-	defer file.Close()
 
-	fileSize := handler.Size
+	fileSize := handlerSize
 	logger = logger.WithField("original_filesize", fileSize)
 
-	providedFilename := r.FormValue("filename")
-	timestamp := r.FormValue("timestamp")
-	sign := r.FormValue("sign")
+	// Injetar valores lidos para o util de build de filename (BuildStandardFilename espera http.Request populado)
+	// Como usamos MultipartReader, r.FormValue não funciona. Precisamos de um r falso ou ajustar o util.
+	// Vamos ajustar o mock do r para que o BuildStandardFilename funcione ou extrair a lógica.
 
-	builtName, buildErr := utils.BuildStandardFilename(r, handler)
+	// Para não quebrar o utils.BuildStandardFilename que usa r.FormValue, vamos popular r.Form temporariamente
+	// se possível, mas r.Form é privado. Vamos usar um workaround ou duplicar lógica simples.
+
+	// Alternativa: o BuildStandardFilename usa r.FormValue. Podemos injetar os campos.
+	r.Form = make(url.Values)
+	r.Form.Set("imei", imei)
+	r.Form.Set("type", typ)
+	r.Form.Set("channel", channel)
+	r.Form.Set("datetime", datetime)
+	r.Form.Set("pattern", pattern)
+	r.Form.Set("raw", raw)
+	r.Form.Set("index", index)
+
+	builtName, buildErr := utils.BuildStandardFilename(r, &multipart.FileHeader{Filename: handlerFilename, Size: handlerSize})
 	finalFilename := strings.TrimSpace(providedFilename)
 	if finalFilename == "" {
 		if buildErr == nil && builtName != "" {
 			finalFilename = builtName
 		} else {
-			finalFilename = handler.Filename
+			finalFilename = handlerFilename
 		}
 	}
 	finalFilename = filepath.Base(finalFilename)
 
-	reqLogger := logger.WithFields(logrus.Fields{
-		"original_filename": handler.Filename,
+	fields := logrus.Fields{
+		"original_filename": handlerFilename,
 		"final_filename":    finalFilename,
 		"provided_filename": providedFilename,
 		"timestamp":         timestamp,
-		"build_error":       buildErr,
-	})
+	}
+	if buildErr != nil && strings.TrimSpace(providedFilename) == "" {
+		fields["build_error"] = buildErr.Error()
+	}
+
+	reqLogger := logger.WithFields(fields)
 	reqLogger.Info("Processing file upload")
 
 	if len(finalFilename) > utils.MaxFilenameLength {
@@ -136,17 +248,28 @@ func (h *Handler) UploadHandler(w http.ResponseWriter, r *http.Request) {
 		savedPath = filepath.Join(h.cfg.VideoPath, finalFilename)
 	}
 
-	// Usa um caminho temporário único para evitar colisões durante o processamento concorrente
+	// Usa um caminho temporário único para evitar colisões
 	tempPath := savedPath + "." + requestID + ".tmp"
-	bytesWritten, err = h.storage.SaveUploadedFile(file, tempPath, reqLogger)
-	if err != nil {
-		utils.WriteJSON(w, http.StatusInternalServerError, utils.JSONResponse{Code: 500, Message: err.Error()})
+
+	// Garantir que o diretório de destino existe
+	if err := os.MkdirAll(filepath.Dir(tempPath), 0755); err != nil {
+		reqLogger.WithError(err).Error("Failed to create destination directory")
+		utils.WriteJSON(w, http.StatusInternalServerError, utils.JSONResponse{Code: 500, Message: "Internal server error"})
 		return
 	}
 
-	if fileSize != bytesWritten {
-		reqLogger.Warnf("File size mismatch. Original: %d, Written: %d. Possible incomplete upload.", fileSize, bytesWritten)
+	// Move o arquivo já streamado para o caminho de processamento (sem double IO)
+	if err := os.Rename(streamedTempPath, tempPath); err != nil {
+		reqLogger.WithError(err).Warn("Failed to rename streamed file, attempting copy fallback")
+		// Fallback para cópia se estiverem em dispositivos diferentes
+		if err := utils.CopyFile(streamedTempPath, tempPath); err != nil {
+			reqLogger.WithError(err).Error("Fallback copy failed")
+			utils.WriteJSON(w, http.StatusInternalServerError, utils.JSONResponse{Code: 500, Message: "Failed to save file"})
+			return
+		}
+		os.Remove(streamedTempPath)
 	}
+	bytesWritten = fileSize
 
 	if h.cfg.EnableLocalStorage {
 		reqLogger.WithFields(logrus.Fields{
@@ -183,9 +306,20 @@ func (h *Handler) UploadHandler(w http.ResponseWriter, r *http.Request) {
 		if ext == ".mp4" {
 			compressedPath, err := processor.CompressWithFFmpeg(uploadPath, logger)
 			if err == nil {
-				// Substitui o arquivo temporário pelo comprimido
-				os.Remove(uploadPath)
-				uploadPath = compressedPath
+				// Comparar tamanhos: se o comprimido for maior que o original (comum com CRF 0 ou arquivos pequenos),
+				// descartamos o comprimido e usamos o original.
+				origStat, _ := os.Stat(uploadPath)
+				compStat, _ := os.Stat(compressedPath)
+				if compStat.Size() < origStat.Size() {
+					os.Remove(uploadPath)
+					uploadPath = compressedPath
+				} else {
+					logger.WithFields(logrus.Fields{
+						"original_size":   origStat.Size(),
+						"compressed_size": compStat.Size(),
+					}).Info("Compressed file is larger than original, keeping original")
+					os.Remove(compressedPath)
+				}
 			} else {
 				logger.WithError(err).Warn("Compression failed, will attempt to upload original")
 			}

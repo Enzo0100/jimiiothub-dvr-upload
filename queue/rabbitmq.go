@@ -23,7 +23,7 @@ type UploadEvent struct {
 	Path     string `json:"path,omitempty"`
 }
 
-func NewRabbitMQClient(url, queueName, exchangeName string, logger *logrus.Logger) (*RabbitMQClient, error) {
+func NewRabbitMQClient(url, queueName, exchangeName string, ttl int, logger *logrus.Logger) (*RabbitMQClient, error) {
 	conn, err := amqp.Dial(url)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to RabbitMQ: %w", err)
@@ -36,13 +36,16 @@ func NewRabbitMQClient(url, queueName, exchangeName string, logger *logrus.Logge
 	}
 
 	if queueName != "" {
+		args := amqp.Table{
+			"x-message-ttl": int32(ttl),
+		}
 		_, err = ch.QueueDeclare(
 			queueName, // name
 			true,      // durable
 			false,     // delete when unused
 			false,     // exclusive
 			false,     // no-wait
-			nil,       // arguments
+			args,      // arguments
 		)
 		if err != nil {
 			ch.Close()

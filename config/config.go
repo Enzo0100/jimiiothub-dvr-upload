@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 )
 
@@ -28,6 +29,7 @@ type Config struct {
 	RabbitMQURL      string
 	RabbitMQQueue    string
 	RabbitMQExchange string
+	RabbitMQTtl      int
 }
 
 func LoadConfig() *Config {
@@ -59,12 +61,25 @@ func LoadConfig() *Config {
 		RabbitMQURL:      rmqURL,
 		RabbitMQQueue:    getEnv("RABBITMQ_QUEUE", "dvr_upload_events"),
 		RabbitMQExchange: getEnv("RABBITMQ_EXCHANGE", "iothub-webhook"),
+		RabbitMQTtl:      getEnvAsInt("RABBITMQ_TTL", 300000),
 	}
 }
 
 func getEnv(key, def string) string {
 	val := os.Getenv(key)
 	if val == "" {
+		return def
+	}
+	return val
+}
+
+func getEnvAsInt(key string, def int) int {
+	valStr := os.Getenv(key)
+	if valStr == "" {
+		return def
+	}
+	val, err := strconv.Atoi(valStr)
+	if err != nil {
 		return def
 	}
 	return val

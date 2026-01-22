@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"time"
 
 	"dvr-upload/config"
 	"dvr-upload/handlers"
@@ -46,7 +47,7 @@ func main() {
 
 	storageService := storage.NewStorageService(cfg, log)
 
-	rabbitMQ, err := queue.NewRabbitMQClient(cfg.RabbitMQURL, cfg.RabbitMQQueue, cfg.RabbitMQExchange, log)
+	rabbitMQ, err := queue.NewRabbitMQClient(cfg.RabbitMQURL, cfg.RabbitMQQueue, cfg.RabbitMQExchange, cfg.RabbitMQTtl, log)
 	if err != nil {
 		log.WithError(err).Warn("Failed to initialize RabbitMQ client")
 	} else {
@@ -55,7 +56,22 @@ func main() {
 
 	h := handlers.NewHandler(cfg, storageService, rabbitMQ, log)
 
-	http.HandleFunc("/upload", h.UploadHandler)
-	http.HandleFunc("/health", h.HealthHandler)
-	log.Fatal(http.ListenAndServe(":23010", nil))
+	mux := http.NewServeMux()
+	mux.HandleFunc("/upload", h.UploadHandler)
+	mux.HandleFunc("/health", h.HealthHandler)
+
+	srv := &http.Server{
+		Addr:              ":23010",
+		Handler:           mux,
+		ReadTimeout:       0, // Permite uploads longos
+		WriteTimeout:      0, // Permite processamento longo
+		IdleTimeout:       120 * time.Second,
+		ReadHeaderTimeout: 30 * time.Second, // Timeout para cabeçalhos (evita Slowloris parcial)
+		MaxHeaderBytes:    1 << 20,          // 1MB
+	}
+
+	log.WithField("addr", srv.Addr).Info("Starting HTTP server")
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		log.Fatalf("Server failed: %s", err)
+	}
 }

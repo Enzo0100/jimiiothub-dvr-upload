@@ -3,8 +3,10 @@ package utils
 import (
 	"errors"
 	"fmt"
+	"io"
 	"mime/multipart"
 	"net/http"
+	"os"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -110,4 +112,21 @@ func leftPad(s string, width int) string {
 		return s
 	}
 	return strings.Repeat("0", width-len(s)) + s
+}
+
+func CopyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	_, err = io.Copy(out, in)
+	return err
 }

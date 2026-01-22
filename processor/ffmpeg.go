@@ -9,13 +9,15 @@ import (
 )
 
 func CompressWithFFmpeg(inputPath string, logger *logrus.Entry) (string, error) {
-	outputPath := inputPath + ".tmp_compressed"
+	// Usar extensão .mp4 para que o ffmpeg consiga detectar o formato do muxer corretamente
+	outputPath := inputPath + ".compressed.mp4"
 	logger.WithFields(logrus.Fields{
 		"input":  inputPath,
 		"output": outputPath,
-	}).Info("Starting ffmpeg compression (lossless)")
+	}).Info("Starting ffmpeg compression (standard H.264)")
 
-	cmd := exec.Command("ffmpeg", "-i", inputPath, "-c:v", "libx264", "-crf", "0", "-preset", "ultrafast", "-y", outputPath)
+	// Alterado de CRF 0 (lossless/gigante) para 23 (standard) e preset medium para melhor eficiência
+	cmd := exec.Command("ffmpeg", "-i", inputPath, "-c:v", "libx264", "-crf", "23", "-preset", "medium", "-y", outputPath)
 
 	output, err := cmd.CombinedOutput()
 	if err != nil {
