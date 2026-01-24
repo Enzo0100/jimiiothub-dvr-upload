@@ -2,6 +2,7 @@ package main
 
 import (
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -11,50 +12,52 @@ import (
 	"dvr-upload/handlers"
 	"dvr-upload/queue"
 	"dvr-upload/storage"
-
-	"github.com/sirupsen/logrus"
+	"dvr-upload/utils"
 )
 
 var (
-	log = logrus.New()
+	logger *slog.Logger
 )
 
 func main() {
 	cfg := config.LoadConfig()
 
 	// setup logging
-	log.SetFormatter(&logrus.JSONFormatter{})
-	log.SetLevel(logrus.InfoLevel)
-	if err := os.MkdirAll(filepath.Dir(cfg.LogFilePath), 0755); err == nil {
-		f, err := os.OpenFile(cfg.LogFilePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-		if err == nil {
-			// log to file and console
-			mw := io.MultiWriter(os.Stdout, f)
-			log.SetOutput(mw)
-		}
+	var mw io.Writer = os.Stdout
+	logDir := filepath.Dir(cfg.LogFilePath)
+	if rotator, err := utils.NewDailyRotateWriter(logDir, 7); err == nil {
+		mw = io.MultiWriter(os.Stdout, rotator)
+		defer rotator.Close()
+	} else {
+		slog.Error("Failed to initialize log rotator", "error", err, "dir", logDir)
 	}
 
-	log.WithFields(logrus.Fields{
-		"listen_addr": ":23010",
-		"video_path":  cfg.VideoPath,
-		"backup_path": cfg.BackupPath,
-		"dr_mode":     cfg.DisasterRecoveryMode,
-	}).Info("[UploadServer] Starting server")
+	handler := slog.NewJSONHandler(mw, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	})
+	logger = slog.New(handler)
+	slog.SetDefault(logger)
+
+	logger.Info("[UploadServer] Starting server",
+		"listen_addr", ":23010",
+		"video_path", cfg.VideoPath,
+		"backup_path", cfg.BackupPath,
+		"dr_mode", cfg.DisasterRecoveryMode)
 
 	if cfg.EnableLocalStorage {
 		os.MkdirAll(cfg.VideoPath, 0755)
 	}
 
-	storageService := storage.NewStorageService(cfg, log)
+	storageService := storage.NewStorageService(cfg, logger)
 
-	rabbitMQ, err := queue.NewRabbitMQClient(cfg.RabbitMQURL, cfg.RabbitMQQueue, cfg.RabbitMQExchange, cfg.RabbitMQTtl, log)
+	rabbitMQ, err := queue.NewRabbitMQClient(cfg.RabbitMQURL, cfg.RabbitMQQueue, cfg.RabbitMQExchange, cfg.RabbitMQTtl, logger)
 	if err != nil {
-		log.WithError(err).Warn("Failed to initialize RabbitMQ client")
+		logger.Warn("Failed to initialize RabbitMQ client", "error", err)
 	} else {
 		defer rabbitMQ.Close()
 	}
 
-	h := handlers.NewHandler(cfg, storageService, rabbitMQ, log)
+	h := handlers.NewHandler(cfg, storageService, rabbitMQ, logger)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/upload", h.UploadHandler)
@@ -71,8 +74,9 @@ func main() {
 		MaxHeaderBytes:    1 << 20,          // 1MB
 	}
 
-	log.WithField("addr", srv.Addr).Info("Starting HTTP server")
+	logger.Info("Starting HTTP server", "addr", srv.Addr)
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Fatalf("Server failed: %s", err)
+		logger.Error("Server failed", "error", err)
+		os.Exit(1)
 	}
 }

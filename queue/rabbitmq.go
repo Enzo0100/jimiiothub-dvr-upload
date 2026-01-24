@@ -3,10 +3,10 @@ package queue
 import (
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
-	"github.com/sirupsen/logrus"
 )
 
 type RabbitMQClient struct {
@@ -14,7 +14,7 @@ type RabbitMQClient struct {
 	channel      *amqp.Channel
 	queueName    string
 	exchangeName string
-	logger       *logrus.Logger
+	logger       *slog.Logger
 }
 
 type UploadEvent struct {
@@ -23,7 +23,7 @@ type UploadEvent struct {
 	Path     string `json:"path,omitempty"`
 }
 
-func NewRabbitMQClient(url, queueName, exchangeName string, ttl int, logger *logrus.Logger) (*RabbitMQClient, error) {
+func NewRabbitMQClient(url, queueName, exchangeName string, ttl int, logger *slog.Logger) (*RabbitMQClient, error) {
 	conn, err := amqp.Dial(url)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to RabbitMQ: %w", err)
@@ -103,12 +103,6 @@ func (c *RabbitMQClient) PublishEvent(event UploadEvent) error {
 	if err != nil {
 		return fmt.Errorf("failed to publish message: %w", err)
 	}
-
-	c.logger.WithFields(logrus.Fields{
-		"exchange": c.exchangeName,
-		"queue":    c.queueName,
-		"filename": event.Filename,
-	}).Info("Event published to RabbitMQ")
 
 	return nil
 }

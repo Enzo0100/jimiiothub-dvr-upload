@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"mime/multipart"
 	"os"
 	"path/filepath"
@@ -16,16 +17,15 @@ import (
 	s3config "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
-	"github.com/sirupsen/logrus"
 )
 
 type StorageService struct {
 	cfg      *config.Config
 	s3Client *s3.Client
-	log      *logrus.Logger
+	log      *slog.Logger
 }
 
-func NewStorageService(cfg *config.Config, log *logrus.Logger) *StorageService {
+func NewStorageService(cfg *config.Config, log *slog.Logger) *StorageService {
 	s := &StorageService{
 		cfg: cfg,
 		log: log,
@@ -46,7 +46,7 @@ func (s *StorageService) initS3() {
 		s3config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(s.cfg.S3AccessKey, s.cfg.S3SecretKey, "")),
 	)
 	if err != nil {
-		s.log.WithError(err).Error("Failed to load AWS config for S3-compatible endpoint")
+		s.log.Error("Failed to load AWS config for S3-compatible endpoint", "error", err)
 		return
 	}
 
@@ -57,13 +57,12 @@ func (s *StorageService) initS3() {
 		o.ResponseChecksumValidation = aws.ResponseChecksumValidationWhenRequired
 	})
 
-	s.log.WithFields(logrus.Fields{
-		"bucket":        s.cfg.S3Bucket,
-		"endpoint":      s.cfg.S3Endpoint,
-		"region":        s.cfg.S3Region,
-		"usePathStyle":  s.cfg.S3UsePathStyle,
-		"checksum_mode": "when_required",
-	}).Info("S3-compatible client (AWS SDK v2 / OCI) initialized")
+	s.log.Info("S3-compatible client (AWS SDK v2 / OCI) initialized",
+		"bucket", s.cfg.S3Bucket,
+		"endpoint", s.cfg.S3Endpoint,
+		"region", s.cfg.S3Region,
+		"use_path_style", s.cfg.S3UsePathStyle,
+		"checksum_mode", "when_required")
 }
 
 func (s *StorageService) Ping() error {
@@ -74,46 +73,45 @@ func (s *StorageService) Ping() error {
 	return err
 }
 
-func (s *StorageService) SaveUploadedFile(file multipart.File, dstPath string, logger *logrus.Entry) (int64, error) {
+func (s *StorageService) SaveUploadedFile(file multipart.File, dstPath string, logger *slog.Logger) (int64, error) {
 	if err := os.MkdirAll(filepath.Dir(dstPath), 0755); err != nil {
-		logger.WithError(err).WithField("path", dstPath).Error("Failed to create directory for file")
+		logger.Error("Failed to create directory for file", "path", dstPath, "error", err)
 		return 0, fmt.Errorf("failed to create directory")
 	}
 
 	dst, err := os.Create(dstPath)
 	if err != nil {
-		logger.WithError(err).WithField("path", dstPath).Error("Failed to create destination file")
+		logger.Error("Failed to create destination file", "path", dstPath, "error", err)
 		return 0, fmt.Errorf("failed to save file")
 	}
 	defer dst.Close()
 
 	if _, err := file.Seek(0, io.SeekStart); err != nil {
-		logger.WithError(err).Error("Failed to seek to the start of the uploaded file stream")
+		logger.Error("Failed to seek to the start of the uploaded file stream", "error", err)
 		return 0, fmt.Errorf("failed to read upload stream")
 	}
 
-	logger.WithField("destination_path", dstPath).Info("Starting file write operation")
+	logger.Info("Starting file write operation", "destination_path", dstPath)
 	bytesWritten, err := io.Copy(dst, file)
 	if err != nil {
 		os.Remove(dstPath)
-		logger.WithError(err).WithFields(logrus.Fields{
-			"path":          dstPath,
-			"bytes_written": bytesWritten,
-		}).Error("Failed to write file content, partial file deleted")
+		logger.Error("Failed to write file content, partial file deleted",
+			"path", dstPath,
+			"bytes_written", bytesWritten,
+			"error", err)
 		return bytesWritten, fmt.Errorf("write failed")
 	}
 
-	logger.WithFields(logrus.Fields{
-		"path":          dstPath,
-		"bytes_written": bytesWritten,
-	}).Info("File written successfully")
+	logger.Info("File written successfully",
+		"path", dstPath,
+		"bytes_written", bytesWritten)
 
 	return bytesWritten, nil
 }
 
-func (s *StorageService) CopyToBackup(srcPath, filename string, logger *logrus.Entry) error {
-	backupLogger := logger.WithField("backup_process", true)
-	backupLogger.Infof("Starting backup for %s", filename)
+func (s *StorageService) CopyToBackup(srcPath, filename string, logger *slog.Logger) error {
+	backupLogger := logger.With("backup_process", true)
+	backupLogger.Info("Starting backup", "filename", filename)
 
 	srcFile, err := os.Open(srcPath)
 	if err != nil {
@@ -138,15 +136,15 @@ func (s *StorageService) CopyToBackup(srcPath, filename string, logger *logrus.E
 		return fmt.Errorf("failed to copy file content to backup (copied %d bytes): %w", bytesCopied, err)
 	}
 
-	backupLogger.WithFields(logrus.Fields{
-		"source_path":  srcPath,
-		"backup_path":  backupDestPath,
-		"bytes_copied": bytesCopied,
-	}).Infof("Successfully backed up %s", filename)
+	backupLogger.Info("Successfully backed up",
+		"filename", filename,
+		"source_path", srcPath,
+		"backup_path", backupDestPath,
+		"bytes_copied", bytesCopied)
 	return nil
 }
 
-func (s *StorageService) UploadFileToS3(filePath string, filename string, logger *logrus.Entry) error {
+func (s *StorageService) UploadFileToS3(filePath string, filename string, logger *slog.Logger) error {
 	if s.s3Client == nil || s.cfg.S3Bucket == "" {
 		logger.Warn("S3 upload skipped: client not initialized or bucket not set")
 		return nil
@@ -175,14 +173,6 @@ func (s *StorageService) UploadFileToS3(filePath string, filename string, logger
 		contentType = "image/jpeg"
 	}
 
-	logger.WithFields(logrus.Fields{
-		"bucket":       s.cfg.S3Bucket,
-		"key":          filename,
-		"filepath":     filePath,
-		"size":         fileSize,
-		"content_type": contentType,
-	}).Info("Uploading file to S3 (AWS SDK v2 / OCI)")
-
 	_, err = s.s3Client.PutObject(context.TODO(), &s3.PutObjectInput{
 		Bucket:        aws.String(s.cfg.S3Bucket),
 		Key:           aws.String(filename),
@@ -194,12 +184,5 @@ func (s *StorageService) UploadFileToS3(filePath string, filename string, logger
 		return fmt.Errorf("failed to upload to S3-compatible storage (duration: %s): %w", time.Since(start), err)
 	}
 
-	duration := time.Since(start)
-	speed := float64(fileSize) / 1024 / 1024 / duration.Seconds() // MB/s
-
-	logger.WithFields(logrus.Fields{
-		"duration":  duration.String(),
-		"speed_mbs": fmt.Sprintf("%.2f MB/s", speed),
-	}).Info("S3-compatible upload successful")
 	return nil
 }
