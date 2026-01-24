@@ -15,6 +15,8 @@ type Config struct {
 	DisasterRecoveryMode bool
 	EnableLocalStorage   bool
 	EnableTsToMp4        bool
+	EnableS3Upload       bool
+	EnableRabbitMQ       bool
 	LogFilePath          string
 
 	// S3 Configuration (OCI Compatibility)
@@ -52,6 +54,8 @@ func LoadConfig() *Config {
 		DisasterRecoveryMode: getEnv("DISASTER_RECOVERY_MODE", "false") == "true",
 		EnableLocalStorage:   getEnv("ENABLE_LOCAL_STORAGE", "true") == "true",
 		EnableTsToMp4:        getEnv("ENABLE_TS_TO_MP4", "true") == "true",
+		EnableS3Upload:       getEnv("ENABLE_S3_UPLOAD", "true") == "true",
+		EnableRabbitMQ:       getEnv("ENABLE_RABBITMQ", "true") == "true",
 		LogFilePath:          "/app/dvr-upload/logs/server.log",
 
 		S3Bucket:       getEnv("OCI_BUCKET_MEDIA", ""),

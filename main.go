@@ -48,13 +48,22 @@ func main() {
 		os.MkdirAll(cfg.VideoPath, 0755)
 	}
 
+	// Inicia tarefa de limpeza de arquivos temporários órfãos
+	utils.StartCleanupTask(cfg.VideoPath, cfg.BackupPath, logger)
+
 	storageService := storage.NewStorageService(cfg, logger)
 
-	rabbitMQ, err := queue.NewRabbitMQClient(cfg.RabbitMQURL, cfg.RabbitMQQueue, cfg.RabbitMQExchange, cfg.RabbitMQTtl, logger)
-	if err != nil {
-		logger.Warn("Failed to initialize RabbitMQ client", "error", err)
+	var rabbitMQ *queue.RabbitMQClient
+	if cfg.EnableRabbitMQ {
+		var err error
+		rabbitMQ, err = queue.NewRabbitMQClient(cfg.RabbitMQURL, cfg.RabbitMQQueue, cfg.RabbitMQExchange, cfg.RabbitMQTtl, logger)
+		if err != nil {
+			logger.Warn("Failed to initialize RabbitMQ client", "error", err)
+		} else {
+			defer rabbitMQ.Close()
+		}
 	} else {
-		defer rabbitMQ.Close()
+		logger.Info("RabbitMQ client skipped (disabled by config)")
 	}
 
 	h := handlers.NewHandler(cfg, storageService, rabbitMQ, logger)

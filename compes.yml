@@ -1,7 +1,7 @@
   dvr-upload:
     restart: always
     container_name: dvr-upload
-    image: enzo0001/dvr-upload:v2.0.8
+    image: enzo0001/dvr-upload:v2.1.2
     ports:
       - "23010:23010"
     volumes:
@@ -30,3 +30,5 @@
       - RABBITMQ_PASSWORD=sm4LreKYZfI3
       - RABBITMQ_EXCHANGE=iothub-media
       - RABBITMQ_QUEUE=iothub-media
+      - ENABLE_S3_UPLOAD=false
+      - ENABLE_RABBITMQ=false

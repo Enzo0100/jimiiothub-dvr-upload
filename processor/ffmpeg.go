@@ -9,12 +9,31 @@ import (
 )
 
 func CompressWithFFmpeg(inputPath string, logger *slog.Logger) (string, error) {
+	// Verificar se o arquivo tem stream de vídeo antes de tentar comprimir
+	probeCmd := exec.Command("ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=codec_type", "-of", "csv=p=0", inputPath)
+	probeOutput, err := probeCmd.Output()
+	if err != nil || strings.TrimSpace(string(probeOutput)) == "" {
+		// Se não tem vídeo ou erro no ffprobe, ignora compressão e não retorna erro (prosseguirá com original)
+		logger.Info("File does not contain a video stream or ffprobe failed, skipping compression", "path", inputPath)
+		return "", nil // Retornar vazio sem erro faz o handler usar o original
+	}
+
 	start := time.Now()
 	// Usar extensão .mp4 para que o ffmpeg consiga detectar o formato do muxer corretamente
 	outputPath := inputPath + ".compressed.mp4"
 
-	// Alterado de CRF 0 (lossless/gigante) para 23 (standard) e preset medium para melhor eficiência
-	cmd := exec.Command("ffmpeg", "-i", inputPath, "-c:v", "libx264", "-crf", "23", "-preset", "medium", "-y", outputPath)
+	// Setup otimizado para máxima eficiência de compressão (tamanho vs qualidade):
+	// Preset 'veryfast' é o melhor equilíbrio entre velocidade e taxa de compressão.
+	// CRF 30 oferece uma compressão excelente (arquivos bem pequenos) com qualidade aceitável para DVR.
+	// -movflags +faststart permite que o vídeo comece a tocar antes de baixar todo o arquivo.
+	cmd := exec.Command("ffmpeg", "-i", inputPath,
+		"-c:v", "libx264",
+		"-crf", "30",
+		"-preset", "veryfast",
+		"-threads", "2",
+		"-movflags", "+faststart",
+		"-pix_fmt", "yuv420p", // Garante compatibilidade máxima com browsers/players
+		"-y", outputPath)
 
 	output, err := cmd.CombinedOutput()
 	if err != nil {

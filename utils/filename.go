@@ -41,15 +41,15 @@ func BuildStandardFilename(r *http.Request, fh *multipart.FileHeader) (string, e
 	}
 
 	// Decide which model: event vs snapshot
-	if pattern == "event" || (imei != "" && typ != "" && channel != "" && (dtRaw != "")) {
+	if pattern == "event" || (imei != "" && typ != "" && channel != "") {
 		// Validate IMEI numeric
-		if !regexp.MustCompile(`^[0-9]{8,20}$`).MatchString(imei) {
+		if imei != "" && !regexp.MustCompile(`^[0-9]{8,20}$`).MatchString(imei) {
 			return "", errors.New("invalid imei")
 		}
-		if typ != "I" && typ != "F" {
+		if typ != "" && typ != "I" && typ != "F" {
 			return "", errors.New("invalid type (expect I or F)")
 		}
-		if !regexp.MustCompile(`^[0-9]{1,3}$`).MatchString(channel) {
+		if channel != "" && !regexp.MustCompile(`^[0-9]{1,3}$`).MatchString(channel) {
 			return "", errors.New("invalid channel")
 		}
 
@@ -65,17 +65,17 @@ func BuildStandardFilename(r *http.Request, fh *multipart.FileHeader) (string, e
 	// Snapshot pattern (heuristic)
 	rawHex := strings.TrimSpace(r.FormValue("raw"))
 	index := strings.TrimSpace(r.FormValue("index"))
-	if pattern == "snapshot" || (imei != "" && rawHex != "" && channel != "" && index != "") {
-		if !regexp.MustCompile(`^[0-9]{8,20}$`).MatchString(imei) {
+	if pattern == "snapshot" || (imei != "" && rawHex != "") {
+		if imei != "" && !regexp.MustCompile(`^[0-9]{8,20}$`).MatchString(imei) {
 			return "", errors.New("invalid imei")
 		}
-		if !regexp.MustCompile(`^[0-9A-Fa-f]+$`).MatchString(rawHex) {
+		if rawHex != "" && !regexp.MustCompile(`^[0-9A-Fa-f]+$`).MatchString(rawHex) {
 			return "", errors.New("invalid raw hex block")
 		}
-		if !regexp.MustCompile(`^[0-9]{1,3}$`).MatchString(channel) {
+		if channel != "" && !regexp.MustCompile(`^[0-9]{1,3}$`).MatchString(channel) {
 			return "", errors.New("invalid channel")
 		}
-		if !regexp.MustCompile(`^[0-9]{1,3}$`).MatchString(index) {
+		if index != "" && !regexp.MustCompile(`^[0-9]{1,3}$`).MatchString(index) {
 			return "", errors.New("invalid index")
 		}
 		return fmt.Sprintf("%s_%s_%s_%s%s", imei, rawHex, channel, leftPad(index, 2), ext), nil

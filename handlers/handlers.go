@@ -357,6 +357,14 @@ func (h *Handler) UploadHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var streamedTempPath string // Novo: guarda o path do arquivo já em disco
+	defer func() {
+		if streamedTempPath != "" {
+			if _, err := os.Stat(streamedTempPath); err == nil {
+				os.Remove(streamedTempPath)
+			}
+		}
+	}()
+
 	var handlerFilename string
 	var handlerSize int64
 	var providedFilename string
@@ -376,6 +384,11 @@ func (h *Handler) UploadHandler(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 		if err != nil {
+			// Se já recebemos o arquivo com sucesso, ignoramos erros em partes subsequentes (podem ser campos opcionais que falharam por timeout)
+			if streamedTempPath != "" {
+				logger.Warn("Connection interrupted or error reading next part, but file was already received. Proceeding.", "error", err)
+				break
+			}
 			logger.Error("Failed to read multipart part", "error", err)
 			utils.WriteJSON(w, http.StatusInternalServerError, utils.JSONResponse{Code: 500, Message: "Error reading upload stream"})
 			return
@@ -384,18 +397,22 @@ func (h *Handler) UploadHandler(w http.ResponseWriter, r *http.Request) {
 		formName := part.FormName()
 		if formName == "file" {
 			handlerFilename = part.FileName()
-			// Determinar diretório base para evitar cross-device links (Rename entre partitions falha)
-			tempDir := os.TempDir()
+			// Determinar diretório base e usar subpasta oculta para isolar do coletor externo
+			baseDir := os.TempDir()
 			if h.cfg.EnableLocalStorage {
 				if h.cfg.DisasterRecoveryMode && h.cfg.BackupPath != "" {
-					tempDir = h.cfg.BackupPath
+					baseDir = h.cfg.BackupPath
 				} else if h.cfg.VideoPath != "" {
-					tempDir = h.cfg.VideoPath
+					baseDir = h.cfg.VideoPath
 				}
 			}
-			// Garante que o diretório escolhido existe ou faz fallback para temp do sistema
-			if _, err := os.Stat(tempDir); os.IsNotExist(err) && tempDir != os.TempDir() {
-				tempDir = os.TempDir()
+
+			// Pasta de processamento oculta para evitar que coletores externos peguem arquivos incompletos
+			tempDir := filepath.Join(baseDir, ".processing")
+			if err := os.MkdirAll(tempDir, 0755); err != nil {
+				// Se falhar ao criar a oculta, usa o baseDir mas loga o aviso
+				logger.Warn("Failed to create hidden processing dir, using base dir", "path", tempDir, "error", err)
+				tempDir = baseDir
 			}
 
 			tempFile, err := os.CreateTemp(tempDir, "upload-stream-*")
@@ -407,12 +424,12 @@ func (h *Handler) UploadHandler(w http.ResponseWriter, r *http.Request) {
 			streamedTempPath = tempFile.Name()
 
 			// Usar um buffer maior para io.Copy para melhorar performance de rede/disco
-			streamStart := time.Now()
 			buffer := make([]byte, 1<<20) // 1MB buffer
 			n, err := io.CopyBuffer(tempFile, part, buffer)
 			if err != nil {
 				tempFile.Close()
 				os.Remove(streamedTempPath)
+				streamedTempPath = "" // Reseta para o defer não tentar remover de novo
 				logger.Error("Error saving file part stream", "bytes_read", n, "error", err)
 				utils.WriteJSON(w, http.StatusInternalServerError, utils.JSONResponse{Code: 500, Message: "Failed to receive file content"})
 				return
@@ -423,7 +440,11 @@ func (h *Handler) UploadHandler(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Processar outros campos do formulário
-		value, _ := io.ReadAll(part)
+		value, errReadAll := io.ReadAll(part)
+		if errReadAll != nil {
+			logger.Warn("Error reading form field", "field", formName, "error", errReadAll)
+			continue
+		}
 		valStr := string(value)
 		switch formName {
 		case "filename":
@@ -518,8 +539,9 @@ func (h *Handler) UploadHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	var bytesWritten int64
 	var savedPath string
+	var processingPath string
+
 	if !h.cfg.EnableLocalStorage {
 		savedPath = filepath.Join(os.TempDir(), finalFilename)
 	} else if h.cfg.DisasterRecoveryMode {
@@ -533,43 +555,51 @@ func (h *Handler) UploadHandler(w http.ResponseWriter, r *http.Request) {
 		savedPath = filepath.Join(h.cfg.VideoPath, finalFilename)
 	}
 
-	// Usa um caminho temporário único para evitar colisões
-	tempPath := savedPath + "." + requestID + ".tmp"
+	// Define path de processamento isolado (na mesma partição para rename rápido)
+	processingBase := filepath.Join(filepath.Dir(savedPath), ".processing")
+	os.MkdirAll(processingBase, 0755)
+	processingPath = filepath.Join(processingBase, finalFilename+"."+requestID+".tmp")
 
-	// Garantir que o diretório de destino existe
-	if err := os.MkdirAll(filepath.Dir(tempPath), 0755); err != nil {
-		reqLogger.Error("Failed to create destination directory", "error", err)
-		utils.WriteJSON(w, http.StatusInternalServerError, utils.JSONResponse{Code: 500, Message: "Internal server error"})
-		return
-	}
-
-	// Move o arquivo já streamado para o caminho de processamento (sem double IO)
-	if err := os.Rename(streamedTempPath, tempPath); err != nil {
-		reqLogger.Warn("Failed to rename streamed file, attempting copy fallback", "error", err)
-		// Fallback para cópia se estiverem em dispositivos diferentes
-		if err := utils.CopyFile(streamedTempPath, tempPath); err != nil {
-			reqLogger.Error("Fallback copy failed", "error", err)
+	// Move o arquivo já streamado para o caminho de processamento isolado
+	if err := os.Rename(streamedTempPath, processingPath); err == nil {
+		streamedTempPath = "" // Limpa para o defer não remover o arquivo movido
+	} else {
+		reqLogger.Warn("Failed to rename streamed file to processing dir, attempting copy", "error", err)
+		if err := utils.CopyFile(streamedTempPath, processingPath); err != nil {
+			reqLogger.Error("Processing copy failed", "error", err)
 			utils.WriteJSON(w, http.StatusInternalServerError, utils.JSONResponse{Code: 500, Message: "Failed to save file"})
 			return
 		}
 		os.Remove(streamedTempPath)
+		streamedTempPath = ""
 	}
-	bytesWritten = fileSize
 
-	go func(path string, filename string, originalSavedPath string, logger *slog.Logger, isLocal bool, startTime time.Time, initialSize int64) {
-		// Adquire semáforo para limitar processamento paralelo (FFmpeg consome muita RAM)
+	go func(path string, filename string, targetFinalPath string, logger *slog.Logger, isLocal bool, startTime time.Time, initialSize int64) {
+		// Adquire semáforo para limitar processamento paralelo
 		h.workerSemaphore <- struct{}{}
-		defer func() { <-h.workerSemaphore }()
 
-		bgStart := time.Now()
 		uploadPath := path
 		uploadFilename := filename
 		currentSize := initialSize
 		ext := strings.ToLower(filepath.Ext(filename))
 
+		defer func() {
+			if r := recover(); r != nil {
+				logger.Error("Panic in processing goroutine", "panic", r)
+			}
+			// Cleanup: remove arquivo de processamento se ainda existir e não for local
+			if uploadPath != "" && strings.Contains(uploadPath, ".processing") {
+				if _, err := os.Stat(uploadPath); err == nil {
+					os.Remove(uploadPath)
+				}
+			}
+			<-h.workerSemaphore
+		}()
+
+		// ...resto do processamento...
+
 		// Conversão opcional TS -> MP4 antes do upload.
 		if ext == ".ts" && h.cfg.EnableTsToMp4 {
-			convStart := time.Now()
 			convertedPath, err := processor.ConvertTSToMP4(path, logger)
 			if err == nil {
 				// Captura o novo tamanho após conversão
@@ -593,7 +623,6 @@ func (h *Handler) UploadHandler(w http.ResponseWriter, r *http.Request) {
 		// Mantém a compressão atual apenas para MP4 (se aplicável).
 		// Se o arquivo original era JPEG ou outro formato, ele pulará este bloco e irá direto para S3
 		if ext == ".mp4" {
-			compStart := time.Now()
 			compressedPath, err := processor.CompressWithFFmpeg(uploadPath, logger)
 			if err == nil {
 				// Comparar tamanhos: se o comprimido for maior que o original (comum com CRF 0 ou arquivos pequenos),
@@ -603,7 +632,6 @@ func (h *Handler) UploadHandler(w http.ResponseWriter, r *http.Request) {
 
 				if errOrig == nil && errComp == nil {
 					if compStat.Size() < origStat.Size() && compStat.Size() > 0 {
-						preCompSize := origStat.Size()
 						compSize := compStat.Size()
 						os.Remove(uploadPath)
 						uploadPath = compressedPath
@@ -617,37 +645,46 @@ func (h *Handler) UploadHandler(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		s3Start := time.Now()
-		if err := h.storage.UploadFileToS3(uploadPath, uploadFilename, logger); err != nil {
-			logger.Error("Failed to upload to S3", "error", err)
-			atomic.AddInt64(&h.failedUploads, 1)
-			// Remove o arquivo temporário mesmo em caso de falha no S3
-			os.Remove(uploadPath)
-			return
+		if h.cfg.EnableS3Upload {
+			if err := h.storage.UploadFileToS3(uploadPath, uploadFilename, logger); err != nil {
+				logger.Error("Failed to upload to S3", "error", err)
+				atomic.AddInt64(&h.failedUploads, 1)
+				return
+			}
+			atomic.AddInt64(&h.successfulUploads, 1)
+		} else {
+			logger.Info("S3 upload skipped (disabled by config)")
+			// Consideramos sucesso local se o upload está desabilitado
+			atomic.AddInt64(&h.successfulUploads, 1)
 		}
 
-		atomic.AddInt64(&h.successfulUploads, 1)
 		atomic.StoreInt64(&h.lastUploadTime, time.Now().Unix())
 
 		finalDestPath := uploadPath
 		if isLocal {
 			// Define o caminho final baseado no nome final do arquivo (pode ter mudado de .ts para .mp4)
-			finalDestPath = filepath.Join(filepath.Dir(originalSavedPath), uploadFilename)
+			finalDestPath = filepath.Join(filepath.Dir(targetFinalPath), uploadFilename)
+
+			// Se o diretório destino não existe, cria (caso tenha sido removido por outro serviço)
+			os.MkdirAll(filepath.Dir(finalDestPath), 0755)
+
 			if err := os.Rename(uploadPath, finalDestPath); err != nil {
-				logger.Warn("Failed to move temporary file to final destination", "error", err)
-				finalDestPath = uploadPath
+				logger.Warn("Failed to move temporary file to final destination, attempting copy", "error", err)
+				if copyErr := utils.CopyFile(uploadPath, finalDestPath); copyErr == nil {
+					os.Remove(uploadPath)
+				} else {
+					logger.Error("Final move/copy failed", "error", copyErr)
+					finalDestPath = uploadPath
+				}
 			}
 		} else {
-			if _, err := os.Stat(uploadPath); err == nil {
-				os.Remove(uploadPath)
-			}
 			finalDestPath = ""
 		}
 
 		// Incrementa contador e dispara evento RabbitMQ apenas após sucesso no upload
 		atomic.AddInt64(&h.mediaCount, 1)
 
-		if h.rabbitMQ != nil {
+		if h.cfg.EnableRabbitMQ && h.rabbitMQ != nil {
 			err := h.rabbitMQ.PublishEvent(queue.UploadEvent{
 				Filename: uploadFilename,
 				Size:     currentSize,
@@ -661,7 +698,7 @@ func (h *Handler) UploadHandler(w http.ResponseWriter, r *http.Request) {
 			"filename", uploadFilename,
 			"size", currentSize,
 			"total_duration", time.Since(startTime).String())
-	}(tempPath, finalFilename, savedPath, reqLogger, h.cfg.EnableLocalStorage, startTime, fileSize)
+	}(processingPath, finalFilename, savedPath, reqLogger, h.cfg.EnableLocalStorage, startTime, fileSize)
 
 	resultStatus = "ack" // Mark as ACK (Acknowledgement) for the summary log
 	utils.WriteJSON(w, http.StatusOK, utils.JSONResponse{Code: 200, Message: "File upload success", Data: finalFilename})
