@@ -32,15 +32,22 @@ type Handler struct {
 	failedUploads     int64
 	lastUploadTime    int64 // Unix timestamp
 	startTime         time.Time
+	workerSemaphore   chan struct{}
 }
 
 func NewHandler(cfg *config.Config, storage *storage.StorageService, rabbitMQ *queue.RabbitMQClient, log *logrus.Logger) *Handler {
+	maxWorkers := cfg.MaxConcurrentWorkers
+	if maxWorkers <= 0 {
+		maxWorkers = 2 // Default seguro
+	}
+
 	return &Handler{
-		cfg:       cfg,
-		storage:   storage,
-		rabbitMQ:  rabbitMQ,
-		log:       log,
-		startTime: time.Now(),
+		cfg:             cfg,
+		storage:         storage,
+		rabbitMQ:        rabbitMQ,
+		log:             log,
+		startTime:       time.Now(),
+		workerSemaphore: make(chan struct{}, maxWorkers),
 	}
 }
 
@@ -563,25 +570,43 @@ func (h *Handler) UploadHandler(w http.ResponseWriter, r *http.Request) {
 		}).Info("Upload success (RAM/Temp storage)")
 	}
 
-	go func(path string, filename string, originalSavedPath string, logger *logrus.Entry, isLocal bool, startTime time.Time) {
+	go func(path string, filename string, originalSavedPath string, logger *logrus.Entry, isLocal bool, startTime time.Time, initialSize int64) {
+		// Adquire semáforo para limitar processamento paralelo (FFmpeg consome muita RAM)
+		h.workerSemaphore <- struct{}{}
+		defer func() { <-h.workerSemaphore }()
+
 		bgStart := time.Now()
 		uploadPath := path
 		uploadFilename := filename
+		currentSize := initialSize
 		ext := strings.ToLower(filepath.Ext(filename))
 
-		logger.WithField("bg_start_delay", bgStart.Sub(startTime).String()).Info("Background processing started")
+		logger.WithFields(logrus.Fields{
+			"bg_start_delay": bgStart.Sub(startTime).String(),
+			"initial_size":   initialSize,
+		}).Info("Background processing started")
 
 		// Conversão opcional TS -> MP4 antes do upload.
 		if ext == ".ts" && h.cfg.EnableTsToMp4 {
 			convStart := time.Now()
 			convertedPath, err := processor.ConvertTSToMP4(path, logger)
 			if err == nil {
-				// Remove o arquivo temporário original se a conversão funcionou
-				os.Remove(path)
-				uploadPath = convertedPath
-				uploadFilename = strings.TrimSuffix(filename, ext) + ".mp4"
-				ext = ".mp4" // Atualiza extensão para o próximo passo (compressão)
-				logger.WithField("duration", time.Since(convStart).String()).Info("TS->MP4 conversion background step done")
+				// Captura o novo tamanho após conversão
+				if stat, statErr := os.Stat(convertedPath); statErr == nil {
+					currentSize = stat.Size()
+					// Remove o arquivo temporário original se a conversão funcionou e temos o novo arquivo
+					os.Remove(path)
+					uploadPath = convertedPath
+					uploadFilename = strings.TrimSuffix(filename, ext) + ".mp4"
+					ext = ".mp4" // Atualiza extensão para o próximo passo (compressão)
+					logger.WithFields(logrus.Fields{
+						"duration": time.Since(convStart).String(),
+						"new_size": currentSize,
+					}).Info("TS->MP4 conversion background step done")
+				} else {
+					logger.WithError(statErr).Warn("TS->MP4 conversion succeeded but could not stat result, keeping original")
+					os.Remove(convertedPath)
+				}
 			} else {
 				logger.WithError(err).Warn("TS->MP4 conversion failed, will attempt to upload original as TS")
 				// Se falhar a conversão, mantemos o arquivo original .ts para upload
@@ -596,30 +621,37 @@ func (h *Handler) UploadHandler(w http.ResponseWriter, r *http.Request) {
 			if err == nil {
 				// Comparar tamanhos: se o comprimido for maior que o original (comum com CRF 0 ou arquivos pequenos),
 				// descartamos o comprimido e usamos o original.
-				origStat, _ := os.Stat(uploadPath)
-				compStat, _ := os.Stat(compressedPath)
-				if compStat.Size() < origStat.Size() {
-					preCompSize := origStat.Size()
-					compSize := compStat.Size()
-					os.Remove(uploadPath)
-					uploadPath = compressedPath
+				origStat, errOrig := os.Stat(uploadPath)
+				compStat, errComp := os.Stat(compressedPath)
 
-					reduction := float64(preCompSize-compSize) / float64(preCompSize) * 100
-					globalReduction := float64(fileSize-compSize) / float64(fileSize) * 100
+				if errOrig == nil && errComp == nil {
+					if compStat.Size() < origStat.Size() && compStat.Size() > 0 {
+						preCompSize := origStat.Size()
+						compSize := compStat.Size()
+						os.Remove(uploadPath)
+						uploadPath = compressedPath
+						currentSize = compSize
 
-					logger.WithFields(logrus.Fields{
-						"duration":             time.Since(compStart).String(),
-						"pre_compression_size": preCompSize,
-						"compressed_size":      compSize,
-						"step_reduction":       fmt.Sprintf("%.2f%%", reduction),
-						"global_reduction":     fmt.Sprintf("%.2f%%", globalReduction),
-					}).Info("Compression background step done (using compressed)")
+						reduction := float64(preCompSize-compSize) / float64(preCompSize) * 100
+						globalReduction := float64(initialSize-compSize) / float64(initialSize) * 100
+
+						logger.WithFields(logrus.Fields{
+							"duration":             time.Since(compStart).String(),
+							"pre_compression_size": preCompSize,
+							"compressed_size":      compSize,
+							"step_reduction":       fmt.Sprintf("%.2f%%", reduction),
+							"global_reduction":     fmt.Sprintf("%.2f%%", globalReduction),
+						}).Info("Compression background step done (using compressed)")
+					} else {
+						logger.WithFields(logrus.Fields{
+							"duration":        time.Since(compStart).String(),
+							"original_size":   origStat.Size(),
+							"compressed_size": compStat.Size(),
+						}).Info("Compressed file is larger than original or empty, keeping original")
+						os.Remove(compressedPath)
+					}
 				} else {
-					logger.WithFields(logrus.Fields{
-						"duration":        time.Since(compStart).String(),
-						"original_size":   origStat.Size(),
-						"compressed_size": compStat.Size(),
-					}).Info("Compressed file is larger than original, keeping original")
+					logger.Warn("Failed to stat files for compression comparison, keeping current")
 					os.Remove(compressedPath)
 				}
 			} else {
@@ -655,25 +687,22 @@ func (h *Handler) UploadHandler(w http.ResponseWriter, r *http.Request) {
 			if _, err := os.Stat(uploadPath); err == nil {
 				os.Remove(uploadPath)
 			}
+			finalDestPath = ""
 		}
 
 		// Incrementa contador e dispara evento RabbitMQ apenas após sucesso no upload
 		atomic.AddInt64(&h.mediaCount, 1)
 
 		if h.rabbitMQ != nil {
-			finalSize := int64(0)
-			if stat, err := os.Stat(finalDestPath); err == nil {
-				finalSize = stat.Size()
-			}
 			logger.WithFields(logrus.Fields{
 				"final_filename": uploadFilename,
-				"final_size":     finalSize,
+				"final_size":     currentSize,
 				"exchange":       h.cfg.RabbitMQExchange,
 				"queue":          h.cfg.RabbitMQQueue,
 			}).Info("Publishing event to RabbitMQ")
 			err := h.rabbitMQ.PublishEvent(queue.UploadEvent{
 				Filename: uploadFilename,
-				Size:     finalSize,
+				Size:     currentSize,
 				Path:     finalDestPath,
 			})
 			if err != nil {
@@ -684,7 +713,7 @@ func (h *Handler) UploadHandler(w http.ResponseWriter, r *http.Request) {
 			"total_duration": time.Since(startTime).String(),
 			"bg_duration":    time.Since(bgStart).String(),
 		}).Info("Background processing finished successfully")
-	}(tempPath, finalFilename, savedPath, reqLogger, h.cfg.EnableLocalStorage, startTime)
+	}(tempPath, finalFilename, savedPath, reqLogger, h.cfg.EnableLocalStorage, startTime, fileSize)
 
 	utils.WriteJSON(w, http.StatusOK, utils.JSONResponse{Code: 200, Message: "File upload success", Data: finalFilename})
 }

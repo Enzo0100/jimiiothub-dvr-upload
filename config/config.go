@@ -30,6 +30,9 @@ type Config struct {
 	RabbitMQQueue    string
 	RabbitMQExchange string
 	RabbitMQTtl      int
+
+	// Workers Configuration
+	MaxConcurrentWorkers int
 }
 
 func LoadConfig() *Config {
@@ -62,6 +65,8 @@ func LoadConfig() *Config {
 		RabbitMQQueue:    getEnv("RABBITMQ_QUEUE", "dvr_upload_events"),
 		RabbitMQExchange: getEnv("RABBITMQ_EXCHANGE", "iothub-webhook"),
 		RabbitMQTtl:      getEnvAsInt("RABBITMQ_TTL", 300000),
+
+		MaxConcurrentWorkers: getEnvAsInt("MAX_CONCURRENT_WORKERS", 6),
 	}
 }
 
