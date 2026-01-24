@@ -66,6 +66,9 @@ func main() {
 
 	h := handlers.NewHandler(cfg, storageService, rabbitMQ, logger)
 
+	// Inicia recuperação de arquivos pendentes de crash anterior
+	go h.StartRecoveryTask()
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/upload", h.UploadHandler)
 	mux.HandleFunc("/health", h.HealthHandler)
@@ -74,8 +77,8 @@ func main() {
 	srv := &http.Server{
 		Addr:              ":23010",
 		Handler:           mux,
-		ReadTimeout:       0, // Permite uploads longos
-		WriteTimeout:      0, // Permite processamento longo
+		ReadTimeout:       5 * time.Minute, // Limite máximo para upload da câmera
+		WriteTimeout:      0,               // Permite processamento longo
 		IdleTimeout:       120 * time.Second,
 		ReadHeaderTimeout: 30 * time.Second, // Timeout para cabeçalhos (evita Slowloris parcial)
 		MaxHeaderBytes:    1 << 20,          // 1MB

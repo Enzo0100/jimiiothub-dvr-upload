@@ -23,14 +23,14 @@ func CompressWithFFmpeg(inputPath string, logger *slog.Logger) (string, error) {
 	outputPath := inputPath + ".compressed.mp4"
 
 	// Setup otimizado para máxima eficiência de compressão (tamanho vs qualidade):
-	// Preset 'veryfast' é o melhor equilíbrio entre velocidade e taxa de compressão.
+	// Preset 'ultrafast' para reduzir tempo de CPU ao máximo em troca de arquivos um pouco maiores
 	// CRF 30 oferece uma compressão excelente (arquivos bem pequenos) com qualidade aceitável para DVR.
 	// -movflags +faststart permite que o vídeo comece a tocar antes de baixar todo o arquivo.
 	cmd := exec.Command("ffmpeg", "-i", inputPath,
 		"-c:v", "libx264",
 		"-crf", "30",
-		"-preset", "veryfast",
-		"-threads", "2",
+		"-preset", "ultrafast",
+		"-threads", "1",
 		"-movflags", "+faststart",
 		"-pix_fmt", "yuv420p", // Garante compatibilidade máxima com browsers/players
 		"-y", outputPath)

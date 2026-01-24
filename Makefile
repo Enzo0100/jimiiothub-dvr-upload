@@ -1,5 +1,5 @@
 IMAGE := enzo0001/dvr-upload
-VERSION ?= v2.3.1
+VERSION ?= v2.4.0
 
 .PHONY: all build push tag help
 

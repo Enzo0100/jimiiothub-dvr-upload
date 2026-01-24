@@ -23,16 +23,21 @@ import (
 )
 
 type Handler struct {
-	cfg               *config.Config
-	storage           *storage.StorageService
-	rabbitMQ          *queue.RabbitMQClient
-	log               *slog.Logger
-	mediaCount        int64
-	successfulUploads int64
-	failedUploads     int64
-	lastUploadTime    int64 // Unix timestamp
-	startTime         time.Time
-	workerSemaphore   chan struct{}
+	cfg                *config.Config
+	storage            *storage.StorageService
+	rabbitMQ           *queue.RabbitMQClient
+	log                *slog.Logger
+	mediaCount         int64
+	successfulUploads  int64
+	failedUploads      int64
+	interruptedUploads int64
+	totalIncoming      int64
+	activeUploads      int64
+	waitingProcessors  int64
+	activeProcessors   int64
+	lastUploadTime     int64 // Unix timestamp
+	startTime          time.Time
+	workerSemaphore    chan struct{}
 
 	// Métricas de tempo (em nanosegundos para precisão no atomic)
 	totalConversionTime int64
@@ -63,6 +68,12 @@ func (h *Handler) HealthHandler(w http.ResponseWriter, r *http.Request) {
 	mediaCount := atomic.LoadInt64(&h.mediaCount)
 	successCount := atomic.LoadInt64(&h.successfulUploads)
 	failCount := atomic.LoadInt64(&h.failedUploads)
+	interruptedCount := atomic.LoadInt64(&h.interruptedUploads)
+	totalIncoming := atomic.LoadInt64(&h.totalIncoming)
+	activeUploads := atomic.LoadInt64(&h.activeUploads)
+	activeProcessors := atomic.LoadInt64(&h.activeProcessors)
+	waitingProcessors := atomic.LoadInt64(&h.waitingProcessors)
+
 	lastTime := atomic.LoadInt64(&h.lastUploadTime)
 
 	// Cálculos de médias de tempo
@@ -117,12 +128,17 @@ func (h *Handler) HealthHandler(w http.ResponseWriter, r *http.Request) {
 		Code:    status,
 		Message: "health check report",
 		Data: map[string]interface{}{
-			"status":             "running",
-			"uptime":             time.Since(h.startTime).String(),
-			"media_total_count":  mediaCount,
-			"successful_uploads": successCount,
-			"failed_uploads":     failCount,
-			"last_processed_at":  lastProcessed,
+			"status":              "running",
+			"uptime":              time.Since(h.startTime).String(),
+			"media_total_count":   mediaCount,
+			"successful_uploads":  successCount,
+			"failed_uploads":      failCount,
+			"interrupted_uploads": interruptedCount,
+			"total_incoming":      totalIncoming,
+			"active_uploads":      activeUploads,
+			"active_processors":   activeProcessors,
+			"waiting_processors":  waitingProcessors,
+			"last_processed_at":   lastProcessed,
 			"metrics": map[string]string{
 				"avg_camera_send_time": avgCameraSend,
 				"avg_conversion_time":  avgConversion,
@@ -180,6 +196,43 @@ func (h *Handler) TestPageHandler(w http.ResponseWriter, r *http.Request) {
             </div>
         </div>
 
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-5 mb-8">
+            <div class="bg-indigo-600/10 border border-indigo-500/20 p-6 rounded-3xl flex items-center justify-between">
+                <div>
+                    <p class="text-[10px] font-bold text-indigo-400 uppercase tracking-widest">Total de Requisições</p>
+                    <h2 id="total-incoming" class="text-4xl font-black mt-2 text-white">0</h2>
+                    <p class="text-[10px] text-slate-500 mt-1">Total de arquivos recebidos via POST</p>
+                </div>
+                <div class="bg-indigo-600/20 p-4 rounded-2xl">
+                    <svg class="w-8 h-8 text-indigo-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"></path></svg>
+                </div>
+            </div>
+
+            <div class="bg-purple-600/10 border border-purple-500/20 p-6 rounded-3xl flex items-center justify-between">
+                <div>
+                    <p class="text-[10px] font-bold text-purple-400 uppercase tracking-widest">Ativos Agora</p>
+                    <div class="flex items-center gap-3 mt-2">
+                        <span class="relative flex h-3 w-3">
+                            <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-purple-400 opacity-75"></span>
+                            <span class="relative inline-flex rounded-full h-3 w-3 bg-purple-500"></span>
+                        </span>
+                        <h2 id="active-processors" class="text-4xl font-black text-white">0</h2>
+                        <div class="ml-4 border-l border-purple-500/30 pl-4">
+                            <p class="text-[10px] font-bold text-slate-500 uppercase">Aguardando CPU</p>
+                            <p id="waiting-processors" class="text-xl font-bold text-purple-300">0</p>
+                        </div>
+                        <div class="ml-4 border-l border-purple-500/30 pl-4">
+                            <p class="text-[10px] font-bold text-indigo-500 uppercase">Em Transmissão</p>
+                            <p id="active-uploads" class="text-xl font-bold text-indigo-300">0</p>
+                        </div>
+                    </div>
+                </div>
+                <div class="bg-purple-600/20 p-4 rounded-2xl">
+                    <svg class="w-8 h-8 text-purple-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path></svg>
+                </div>
+            </div>
+        </div>
+
         <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-5 mb-8">
             <div class="stat-card p-6 rounded-3xl relative overflow-hidden">
                 <p class="text-[10px] font-bold text-slate-500 uppercase tracking-widest">Total de Arquivos</p>
@@ -187,6 +240,8 @@ func (h *Handler) TestPageHandler(w http.ResponseWriter, r *http.Request) {
                 <div class="mt-4 flex items-center gap-2">
                     <span class="text-[10px] text-green-400 font-bold" id="success-count">OK: 0</span>
                     <span class="text-[10px] text-red-400 font-bold" id="fail-count">FAIL: 0</span>
+                    <span class="text-[10px] text-orange-400 font-bold" title="Upload da câmera interrompido">INT: <span id="interrupted-count">0</span></span>
+                    <span class="text-[10px] text-slate-400 ml-auto font-bold" id="success-rate">0%</span>
                 </div>
             </div>
 
@@ -257,9 +312,19 @@ func (h *Handler) TestPageHandler(w http.ResponseWriter, r *http.Request) {
                 const metrics = d.data.metrics;
                 const deps = d.data.dependencies;
 
+                document.getElementById('total-incoming').innerText = d.data.total_incoming || 0;
+                document.getElementById('active-processors').innerText = d.data.active_processors || 0;
+                document.getElementById('waiting-processors').innerText = d.data.waiting_processors || 0;
+                document.getElementById('active-uploads').innerText = d.data.active_uploads || 0;
                 document.getElementById('media-total').innerText = d.data.media_total_count;
                 document.getElementById('success-count').innerText = "OK: " + d.data.successful_uploads;
                 document.getElementById('fail-count').innerText = "FAIL: " + d.data.failed_uploads;
+                document.getElementById('interrupted-count').innerText = d.data.interrupted_uploads || 0;
+                
+                const total = d.data.successful_uploads + d.data.failed_uploads;
+                const rate = total > 0 ? ((d.data.successful_uploads / total) * 100).toFixed(1) : 0;
+                document.getElementById('success-rate').innerText = rate + "%";
+
                 document.getElementById('avg-camera').innerText = metrics.avg_camera_send_time;
                 document.getElementById('avg-conversion').innerText = metrics.avg_conversion_time;
                 document.getElementById('avg-s3').innerText = metrics.avg_s3_upload_time;
@@ -332,11 +397,14 @@ func (h *Handler) TestPageHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) UploadHandler(w http.ResponseWriter, r *http.Request) {
+	atomic.AddInt64(&h.totalIncoming, 1)
+	atomic.AddInt64(&h.activeUploads, 1)
 	startTime := time.Now()
 	requestID := uuid.New().String()
 	resultStatus := "nak" // Default is NAK (Negative Acknowledgement)
 
 	defer func() {
+		atomic.AddInt64(&h.activeUploads, -1)
 		endTime := time.Now()
 		h.log.Info("POST request summary",
 			"request_id", requestID,
@@ -357,6 +425,7 @@ func (h *Handler) UploadHandler(w http.ResponseWriter, r *http.Request) {
 	// Usar MultipartReader para processamento mais eficiente de grandes volumes de dados (streaming)
 	reader, err := r.MultipartReader()
 	if err != nil {
+		atomic.AddInt64(&h.failedUploads, 1)
 		logger.Error("Failed to create multipart reader", "error", err)
 		utils.WriteJSON(w, http.StatusBadRequest, utils.JSONResponse{Code: 400, Message: "Expected multipart/form-data"})
 		return
@@ -366,6 +435,7 @@ func (h *Handler) UploadHandler(w http.ResponseWriter, r *http.Request) {
 	defer func() {
 		if streamedTempPath != "" {
 			if _, err := os.Stat(streamedTempPath); err == nil {
+				h.log.Warn("Cleaning up abandoned stream file", "path", streamedTempPath)
 				os.Remove(streamedTempPath)
 			}
 		}
@@ -396,6 +466,7 @@ func (h *Handler) UploadHandler(w http.ResponseWriter, r *http.Request) {
 				break
 			}
 			logger.Error("Failed to read multipart part", "error", err)
+			atomic.AddInt64(&h.failedUploads, 1)
 			utils.WriteJSON(w, http.StatusInternalServerError, utils.JSONResponse{Code: 500, Message: "Error reading upload stream"})
 			return
 		}
@@ -423,6 +494,7 @@ func (h *Handler) UploadHandler(w http.ResponseWriter, r *http.Request) {
 
 			tempFile, err := os.CreateTemp(tempDir, "upload-stream-*")
 			if err != nil {
+				atomic.AddInt64(&h.failedUploads, 1)
 				logger.Error("Failed to create temporary file for streaming", "error", err)
 				utils.WriteJSON(w, http.StatusInternalServerError, utils.JSONResponse{Code: 500, Message: "Internal server error"})
 				return
@@ -433,6 +505,7 @@ func (h *Handler) UploadHandler(w http.ResponseWriter, r *http.Request) {
 			buffer := make([]byte, 1<<20) // 1MB buffer
 			n, err := io.CopyBuffer(tempFile, part, buffer)
 			if err != nil {
+				atomic.AddInt64(&h.interruptedUploads, 1)
 				tempFile.Close()
 				os.Remove(streamedTempPath)
 				streamedTempPath = "" // Reseta para o defer não tentar remover de novo
@@ -483,6 +556,7 @@ func (h *Handler) UploadHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if streamedTempPath == "" {
+		atomic.AddInt64(&h.failedUploads, 1)
 		logger.Error("File is required in the form")
 		utils.WriteJSON(w, http.StatusBadRequest, utils.JSONResponse{Code: 400, Message: "File is required"})
 		return
@@ -530,6 +604,7 @@ func (h *Handler) UploadHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if len(finalFilename) > utils.MaxFilenameLength {
+		atomic.AddInt64(&h.failedUploads, 1) // Corrigindo: Incrementa falha para tirar da fila
 		reqLogger.Error("Final filename exceeds max length")
 		utils.WriteJSON(w, http.StatusInternalServerError, utils.JSONResponse{Code: 500, Message: "File name too long"})
 		return
@@ -542,6 +617,7 @@ func (h *Handler) UploadHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		expected := utils.GenerateSign(baseForSign, timestamp, h.cfg.SecretKey)
 		if sign != expected {
+			atomic.AddInt64(&h.failedUploads, 1)
 			reqLogger.Warn("Invalid signature",
 				"received_sign", sign,
 				"expected_sign", expected,
@@ -558,6 +634,7 @@ func (h *Handler) UploadHandler(w http.ResponseWriter, r *http.Request) {
 		savedPath = filepath.Join(os.TempDir(), finalFilename)
 	} else if h.cfg.DisasterRecoveryMode {
 		if h.cfg.BackupPath == "" {
+			atomic.AddInt64(&h.failedUploads, 1)
 			reqLogger.Error("Disaster Recovery mode is ON but BACKUP_VIDEO_PATH is not set.")
 			utils.WriteJSON(w, http.StatusInternalServerError, utils.JSONResponse{Code: 500, Message: "Disaster recovery misconfigured"})
 			return
@@ -567,8 +644,15 @@ func (h *Handler) UploadHandler(w http.ResponseWriter, r *http.Request) {
 		savedPath = filepath.Join(h.cfg.VideoPath, finalFilename)
 	}
 
-	// Define path de processamento isolado (na mesma partição para rename rápido)
-	processingBase := filepath.Join(filepath.Dir(savedPath), ".processing")
+	// Define path de processamento isolado (fora da pasta final para mantê-la limpa)
+	// Usamos um prefixo '.' para manter a pasta oculta se possível no mesmo nível da pasta de vídeos
+	// Precisamos do nome da pasta pai (VideoPath ou BackupPath)
+	uploadDir := h.cfg.VideoPath
+	if h.cfg.DisasterRecoveryMode && h.cfg.BackupPath != "" {
+		uploadDir = h.cfg.BackupPath
+	}
+
+	processingBase := filepath.Join(filepath.Dir(filepath.Clean(uploadDir)), ".processing_"+filepath.Base(filepath.Clean(uploadDir)))
 	os.MkdirAll(processingBase, 0755)
 	processingPath = filepath.Join(processingBase, finalFilename+"."+requestID+".tmp")
 
@@ -578,6 +662,7 @@ func (h *Handler) UploadHandler(w http.ResponseWriter, r *http.Request) {
 	} else {
 		reqLogger.Warn("Failed to rename streamed file to processing dir, attempting copy", "error", err)
 		if err := utils.CopyFile(streamedTempPath, processingPath); err != nil {
+			atomic.AddInt64(&h.failedUploads, 1)
 			reqLogger.Error("Processing copy failed", "error", err)
 			utils.WriteJSON(w, http.StatusInternalServerError, utils.JSONResponse{Code: 500, Message: "Failed to save file"})
 			return
@@ -586,145 +671,221 @@ func (h *Handler) UploadHandler(w http.ResponseWriter, r *http.Request) {
 		streamedTempPath = ""
 	}
 
-	go func(path string, filename string, targetFinalPath string, logger *slog.Logger, isLocal bool, startTime time.Time, initialSize int64) {
-		// Adquire semáforo para limitar processamento paralelo
-		h.workerSemaphore <- struct{}{}
-
-		uploadPath := path
-		uploadFilename := filename
-		currentSize := initialSize
-		ext := strings.ToLower(filepath.Ext(filename))
-
-		defer func() {
-			if r := recover(); r != nil {
-				logger.Error("Panic in processing goroutine", "panic", r)
-			}
-			// Cleanup: remove arquivo de processamento se ainda existir e não for local
-			if uploadPath != "" && strings.Contains(uploadPath, ".processing") {
-				if _, err := os.Stat(uploadPath); err == nil {
-					os.Remove(uploadPath)
-				}
-			}
-			<-h.workerSemaphore
-		}()
-
-		// ...resto do processamento...
-
-		// Conversão opcional TS -> MP4 antes do upload.
-		if ext == ".ts" && h.cfg.EnableTsToMp4 {
-			convStart := time.Now()
-			convertedPath, err := processor.ConvertTSToMP4(path, logger)
-			if err == nil {
-				// Métrica: Sucesso na conversão
-				atomic.AddInt64(&h.totalConversionTime, int64(time.Since(convStart)))
-				atomic.AddInt64(&h.conversionCount, 1)
-
-				// Captura o novo tamanho após conversão
-				if stat, statErr := os.Stat(convertedPath); statErr == nil {
-					currentSize = stat.Size()
-					// Remove o arquivo temporário original se a conversão funcionou e temos o novo arquivo
-					os.Remove(path)
-					uploadPath = convertedPath
-					uploadFilename = strings.TrimSuffix(filename, ext) + ".mp4"
-					ext = ".mp4" // Atualiza extensão para o próximo passo (compressão)
-				} else {
-					logger.Warn("TS->MP4 conversion succeeded but could not stat result", "error", statErr)
-					os.Remove(convertedPath)
-				}
-			} else {
-				logger.Warn("TS->MP4 conversion failed, will attempt to upload original as TS", "error", err)
-				// Se falhar a conversão, mantemos o arquivo original .ts para upload
-			}
-		}
-
-		// Mantém a compressão atual apenas para MP4 (se aplicável).
-		// Se o arquivo original era JPEG ou outro formato, ele pulará este bloco e irá direto para S3
-		if ext == ".mp4" {
-			compStart := time.Now()
-			compressedPath, err := processor.CompressWithFFmpeg(uploadPath, logger)
-			if err == nil {
-				// Somar tempo de compressão à métrica de conversão
-				atomic.AddInt64(&h.totalConversionTime, int64(time.Since(compStart)))
-				atomic.AddInt64(&h.conversionCount, 1)
-
-				// Comparar tamanhos: se o comprimido for maior que o original (comum com CRF 0 ou arquivos pequenos),
-				// descartamos o comprimido e usamos o original.
-				origStat, errOrig := os.Stat(uploadPath)
-				compStat, errComp := os.Stat(compressedPath)
-
-				if errOrig == nil && errComp == nil {
-					if compStat.Size() < origStat.Size() && compStat.Size() > 0 {
-						compSize := compStat.Size()
-						os.Remove(uploadPath)
-						uploadPath = compressedPath
-						currentSize = compSize
-					} else {
-						os.Remove(compressedPath)
-					}
-				} else {
-					os.Remove(compressedPath)
-				}
-			}
-		}
-
-		if h.cfg.EnableS3Upload {
-			s3Start := time.Now()
-			if err := h.storage.UploadFileToS3(uploadPath, uploadFilename, logger); err != nil {
-				logger.Error("Failed to upload to S3", "error", err)
-				atomic.AddInt64(&h.failedUploads, 1)
-				return
-			}
-			// Métrica: Sucesso no upload S3
-			atomic.AddInt64(&h.totalS3UploadTime, int64(time.Since(s3Start)))
-			atomic.AddInt64(&h.s3UploadCount, 1)
-			atomic.AddInt64(&h.successfulUploads, 1)
-		} else {
-			// Apenas incrementa sucesso se não houver upload externo habilitado
-			atomic.AddInt64(&h.successfulUploads, 1)
-		}
-
-		atomic.StoreInt64(&h.lastUploadTime, time.Now().Unix())
-
-		finalDestPath := uploadPath
-		if isLocal {
-			// Define o caminho final baseado no nome final do arquivo (pode ter mudado de .ts para .mp4)
-			finalDestPath = filepath.Join(filepath.Dir(targetFinalPath), uploadFilename)
-
-			// Se o diretório destino não existe, cria (caso tenha sido removido por outro serviço)
-			os.MkdirAll(filepath.Dir(finalDestPath), 0755)
-
-			if err := os.Rename(uploadPath, finalDestPath); err != nil {
-				logger.Warn("Failed to move temporary file to final destination, attempting copy", "error", err)
-				if copyErr := utils.CopyFile(uploadPath, finalDestPath); copyErr == nil {
-					os.Remove(uploadPath)
-				} else {
-					logger.Error("Final move/copy failed", "error", copyErr)
-					finalDestPath = uploadPath
-				}
-			}
-		} else {
-			finalDestPath = ""
-		}
-
-		// Incrementa contador e dispara evento RabbitMQ apenas após sucesso no upload
-		atomic.AddInt64(&h.mediaCount, 1)
-
-		if h.cfg.EnableRabbitMQ && h.rabbitMQ != nil {
-			err := h.rabbitMQ.PublishEvent(queue.UploadEvent{
-				Filename: uploadFilename,
-				Size:     currentSize,
-				Path:     finalDestPath,
-			})
-			if err != nil {
-				logger.Error("Failed to publish event to RabbitMQ after processing", "error", err)
-			}
-		}
-		logger.Info("Upload and processing finished",
-			"filename", uploadFilename,
-			"size", currentSize,
-			"total_duration", time.Since(startTime).String())
-	}(processingPath, finalFilename, savedPath, reqLogger, h.cfg.EnableLocalStorage, startTime, fileSize)
+	go h.processFile(processingPath, finalFilename, savedPath, reqLogger, h.cfg.EnableLocalStorage, startTime, fileSize)
 
 	resultStatus = "ack" // Mark as ACK (Acknowledgement) for the summary log
 	utils.WriteJSON(w, http.StatusOK, utils.JSONResponse{Code: 200, Message: "File upload success", Data: finalFilename})
+}
+
+func (h *Handler) processFile(path string, filename string, targetFinalPath string, logger *slog.Logger, isLocal bool, startTime time.Time, initialSize int64) {
+	atomic.AddInt64(&h.waitingProcessors, 1)
+	// Adquire semáforo para limitar processamento paralelo
+	h.workerSemaphore <- struct{}{}
+	atomic.AddInt64(&h.waitingProcessors, -1)
+	atomic.AddInt64(&h.activeProcessors, 1)
+
+	uploadPath := path
+	uploadFilename := filename
+	currentSize := initialSize
+	ext := strings.ToLower(filepath.Ext(filename))
+
+	defer func() {
+		atomic.AddInt64(&h.activeProcessors, -1)
+		if r := recover(); r != nil {
+			logger.Error("Panic in processing goroutine", "panic", r)
+		}
+		// Cleanup: remove arquivo de processamento se ainda existir e não for local
+		if uploadPath != "" && strings.Contains(uploadPath, ".processing") {
+			if _, err := os.Stat(uploadPath); err == nil {
+				os.Remove(uploadPath)
+			}
+		}
+		<-h.workerSemaphore
+	}()
+
+	// Conversão opcional TS -> MP4 antes do upload.
+	if ext == ".ts" && h.cfg.EnableTsToMp4 {
+		convStart := time.Now()
+		convertedPath, err := processor.ConvertTSToMP4(uploadPath, logger)
+		if err == nil {
+			// Métrica: Sucesso na conversão
+			atomic.AddInt64(&h.totalConversionTime, int64(time.Since(convStart)))
+			atomic.AddInt64(&h.conversionCount, 1)
+
+			// Captura o novo tamanho após conversão
+			if stat, statErr := os.Stat(convertedPath); statErr == nil {
+				currentSize = stat.Size()
+				// Remove o arquivo temporário original se a conversão funcionou e temos o novo arquivo
+				os.Remove(uploadPath)
+				uploadPath = convertedPath
+				uploadFilename = strings.TrimSuffix(filename, ext) + ".mp4"
+				ext = ".mp4" // Atualiza extensão para o próximo passo (compressão)
+			} else {
+				logger.Warn("TS->MP4 conversion succeeded but could not stat result", "error", statErr)
+				os.Remove(convertedPath)
+			}
+		} else {
+			logger.Warn("TS->MP4 conversion failed, will attempt to upload original as TS", "error", err)
+			// Se falhar a conversão, mantemos o arquivo original .ts para upload
+		}
+	}
+
+	// Mantém a compressão atual apenas para MP4 (se aplicável).
+	if ext == ".mp4" && h.cfg.EnableCompression {
+		compStart := time.Now()
+		compressedPath, err := processor.CompressWithFFmpeg(uploadPath, logger)
+		if err == nil {
+			// Somar tempo de compressão à métrica de conversão
+			atomic.AddInt64(&h.totalConversionTime, int64(time.Since(compStart)))
+			atomic.AddInt64(&h.conversionCount, 1)
+
+			// Comparar tamanhos: se o comprimido for maior que o original (comum com CRF 0 ou arquivos pequenos),
+			// descartamos o comprimido e usamos o original.
+			origStat, errOrig := os.Stat(uploadPath)
+			compStat, errComp := os.Stat(compressedPath)
+
+			if errOrig == nil && errComp == nil {
+				if compStat.Size() < origStat.Size() && compStat.Size() > 0 {
+					compSize := compStat.Size()
+					os.Remove(uploadPath)
+					uploadPath = compressedPath
+					currentSize = compSize
+				} else {
+					os.Remove(compressedPath)
+				}
+			} else {
+				os.Remove(compressedPath)
+			}
+		}
+	}
+
+	if h.cfg.EnableS3Upload {
+		s3Start := time.Now()
+		if err := h.storage.UploadFileToS3(uploadPath, uploadFilename, logger); err != nil {
+			logger.Error("Failed to upload to S3", "error", err)
+			atomic.AddInt64(&h.failedUploads, 1)
+			return
+		}
+		// Métrica: Sucesso no upload S3
+		atomic.AddInt64(&h.totalS3UploadTime, int64(time.Since(s3Start)))
+		atomic.AddInt64(&h.s3UploadCount, 1)
+		atomic.AddInt64(&h.successfulUploads, 1)
+	} else {
+		// Apenas incrementa sucesso se não houver upload externo habilitado
+		atomic.AddInt64(&h.successfulUploads, 1)
+	}
+
+	atomic.StoreInt64(&h.lastUploadTime, time.Now().Unix())
+
+	finalDestPath := uploadPath
+	if isLocal {
+		// Define o caminho final baseado no nome final do arquivo (pode ter mudado de .ts para .mp4)
+		finalDestPath = filepath.Join(filepath.Dir(targetFinalPath), uploadFilename)
+
+		// Se o diretório destino não existe, cria (caso tenha sido removido por outro serviço)
+		os.MkdirAll(filepath.Dir(finalDestPath), 0755)
+
+		if err := os.Rename(uploadPath, finalDestPath); err != nil {
+			logger.Warn("Failed to move temporary file to final destination, attempting copy", "error", err)
+			if copyErr := utils.CopyFile(uploadPath, finalDestPath); copyErr == nil {
+				os.Remove(uploadPath)
+			} else {
+				logger.Error("Final move/copy failed", "error", copyErr)
+				finalDestPath = uploadPath
+			}
+		}
+	} else {
+		finalDestPath = ""
+	}
+
+	// Incrementa contador e dispara evento RabbitMQ apenas após sucesso no upload
+	atomic.AddInt64(&h.mediaCount, 1)
+
+	if h.cfg.EnableRabbitMQ && h.rabbitMQ != nil {
+		err := h.rabbitMQ.PublishEvent(queue.UploadEvent{
+			Filename: uploadFilename,
+			Size:     currentSize,
+			Path:     finalDestPath,
+		})
+		if err != nil {
+			logger.Error("Failed to publish event to RabbitMQ after processing", "error", err)
+		}
+	}
+	logger.Info("Upload and processing finished",
+		"filename", uploadFilename,
+		"size", currentSize,
+		"total_duration", time.Since(startTime).String())
+}
+
+func (h *Handler) StartRecoveryTask() {
+	logger := slog.With("task", "recovery")
+	logger.Info("Starting recovery scan for orphaned files in .processing folders")
+
+	scanDir := func(basePath string) {
+		// Varre tanto o caminho novo (fora da pasta) quanto o antigo (dentro da pasta) para transição suave
+		procDirs := []string{
+			filepath.Join(basePath, ".processing"),
+			filepath.Join(filepath.Dir(filepath.Clean(basePath)), ".processing_"+filepath.Base(filepath.Clean(basePath))),
+		}
+
+		for _, procDir := range procDirs {
+			entries, err := os.ReadDir(procDir)
+			if err != nil {
+				if !os.IsNotExist(err) {
+					logger.Error("Failed to read processing directory", "path", procDir, "error", err)
+				}
+				continue
+			}
+
+			for _, entry := range entries {
+				if entry.IsDir() {
+					continue
+				}
+
+				filePath := filepath.Join(procDir, entry.Name())
+				info, err := entry.Info()
+				if err != nil {
+					continue
+				}
+
+				// Ignora arquivos muito recentes (podem estar sendo escritos agora se o serviço acabou de subir)
+				if time.Since(info.ModTime()) < 10*time.Second {
+					continue
+				}
+
+				logger.Info("Recovering orphaned file", "file", entry.Name())
+
+				// Tenta recuperar o nome original (remove .UUID.tmp do final)
+				originalName := entry.Name()
+				if strings.HasSuffix(originalName, ".tmp") {
+					tempName := strings.TrimSuffix(originalName, ".tmp")
+					lastDot := strings.LastIndex(tempName, ".")
+					if lastDot != -1 {
+						// Verifica se o que sobrou após o último ponto parece um UUID (36 chars)
+						// Se sim, removemos. Se não, mantemos (pode ser arquivo comum .tmp)
+						uuidPart := tempName[lastDot+1:]
+						if len(uuidPart) == 36 || len(uuidPart) == 32 {
+							originalName = tempName[:lastDot]
+						}
+					}
+				}
+
+				// Tenta inferir se é local baseado no path original (se estiver no VideoPath ou BackupPath)
+				isLocal := strings.HasPrefix(filePath, h.cfg.VideoPath) || strings.HasPrefix(filePath, h.cfg.BackupPath)
+
+				// Para arquivos recuperados, o targetFinalPath seria o diretório pai da pasta de destino final
+				// No novo modelo, procDir está fora da pasta final, então usamos basePath diretamente
+				targetFinalPath := filepath.Join(basePath, originalName)
+
+				go h.processFile(filePath, originalName, targetFinalPath, logger, isLocal, time.Now(), info.Size())
+			}
+		}
+	}
+
+	if h.cfg.VideoPath != "" {
+		scanDir(h.cfg.VideoPath)
+	}
+	if h.cfg.BackupPath != "" {
+		scanDir(h.cfg.BackupPath)
+	}
 }

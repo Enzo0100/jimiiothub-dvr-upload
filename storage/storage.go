@@ -177,7 +177,10 @@ func (s *StorageService) UploadFileToS3(filePath string, filename string, logger
 		contentType = "image/jpeg"
 	}
 
-	_, err = s.s3Client.PutObject(context.TODO(), &s3.PutObjectInput{
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	_, err = s.s3Client.PutObject(ctx, &s3.PutObjectInput{
 		Bucket:        aws.String(s.cfg.S3Bucket),
 		Key:           aws.String(filename),
 		Body:          f,

@@ -35,6 +35,7 @@ type Config struct {
 
 	// Workers Configuration
 	MaxConcurrentWorkers int
+	EnableCompression    bool
 }
 
 func LoadConfig() *Config {
@@ -71,6 +72,7 @@ func LoadConfig() *Config {
 		RabbitMQTtl:      getEnvAsInt("RABBITMQ_TTL", 300000),
 
 		MaxConcurrentWorkers: getEnvAsInt("MAX_CONCURRENT_WORKERS", 6),
+		EnableCompression:    getEnv("ENABLE_COMPRESSION", "true") == "true",
 	}
 }
 
