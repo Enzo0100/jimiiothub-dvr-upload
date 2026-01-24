@@ -36,7 +36,6 @@ func NewStorageService(cfg *config.Config, log *slog.Logger) *StorageService {
 
 func (s *StorageService) initS3() {
 	if !s.cfg.EnableS3Upload {
-		s.log.Info("S3/OCI upload is disabled by configuration")
 		return
 	}
 

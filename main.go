@@ -62,8 +62,6 @@ func main() {
 		} else {
 			defer rabbitMQ.Close()
 		}
-	} else {
-		logger.Info("RabbitMQ client skipped (disabled by config)")
 	}
 
 	h := handlers.NewHandler(cfg, storageService, rabbitMQ, logger)

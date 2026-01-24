@@ -33,6 +33,14 @@ type Handler struct {
 	lastUploadTime    int64 // Unix timestamp
 	startTime         time.Time
 	workerSemaphore   chan struct{}
+
+	// Métricas de tempo (em nanosegundos para precisão no atomic)
+	totalConversionTime int64
+	conversionCount     int64
+	totalS3UploadTime   int64
+	s3UploadCount       int64
+	totalCameraSendTime int64
+	cameraSendCount     int64
 }
 
 func NewHandler(cfg *config.Config, storage *storage.StorageService, rabbitMQ *queue.RabbitMQClient, log *slog.Logger) *Handler {
@@ -56,6 +64,30 @@ func (h *Handler) HealthHandler(w http.ResponseWriter, r *http.Request) {
 	successCount := atomic.LoadInt64(&h.successfulUploads)
 	failCount := atomic.LoadInt64(&h.failedUploads)
 	lastTime := atomic.LoadInt64(&h.lastUploadTime)
+
+	// Cálculos de médias de tempo
+	var avgCameraSend, avgConversion, avgS3Upload string
+
+	camCount := atomic.LoadInt64(&h.cameraSendCount)
+	if camCount > 0 {
+		avgCameraSend = (time.Duration(atomic.LoadInt64(&h.totalCameraSendTime)) / time.Duration(camCount)).String()
+	} else {
+		avgCameraSend = "0s"
+	}
+
+	convCount := atomic.LoadInt64(&h.conversionCount)
+	if convCount > 0 {
+		avgConversion = (time.Duration(atomic.LoadInt64(&h.totalConversionTime)) / time.Duration(convCount)).String()
+	} else {
+		avgConversion = "0s"
+	}
+
+	s3Count := atomic.LoadInt64(&h.s3UploadCount)
+	if s3Count > 0 {
+		avgS3Upload = (time.Duration(atomic.LoadInt64(&h.totalS3UploadTime)) / time.Duration(s3Count)).String()
+	} else {
+		avgS3Upload = "0s"
+	}
 
 	s3Status := "ok"
 	if err := h.storage.Ping(); err != nil {
@@ -91,6 +123,11 @@ func (h *Handler) HealthHandler(w http.ResponseWriter, r *http.Request) {
 			"successful_uploads": successCount,
 			"failed_uploads":     failCount,
 			"last_processed_at":  lastProcessed,
+			"metrics": map[string]string{
+				"avg_camera_send_time": avgCameraSend,
+				"avg_conversion_time":  avgConversion,
+				"avg_s3_upload_time":   avgS3Upload,
+			},
 			"dependencies": map[string]string{
 				"s3_storage": s3Status,
 				"rabbitmq":   rmqStatus,
@@ -100,148 +137,111 @@ func (h *Handler) HealthHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) TestPageHandler(w http.ResponseWriter, r *http.Request) {
-	html := `
-<!DOCTYPE html>
+	html := `<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>DVR Upload Dashboard</title>
+    <title>DVR Monitor</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
     <style>
-        :root {
-            --primary: #4f46e5;
-            --primary-hover: #4338ca;
-            --bg: #f8fafc;
-            --card-bg: #ffffff;
-            --text-main: #1e293b;
-            --text-muted: #64748b;
-            --border: #e2e8f0;
-            --success: #22c55e;
-        }
-        body { 
-            font-family: 'Inter', -apple-system, sans-serif; 
-            background-color: var(--bg);
-            color: var(--text-main);
-            max-width: 900px; 
-            margin: 0 auto; 
-            padding: 40px 20px; 
-            line-height: 1.5; 
-        }
-        .header { text-align: center; margin-bottom: 40px; }
-        .header h1 { margin: 0; font-size: 2.25rem; color: var(--text-main); font-weight: 800; letter-spacing: -0.025em; }
-        .header p { color: var(--text-muted); margin-top: 8px; }
-
-        .grid { display: grid; grid-template-columns: 1fr; gap: 24px; }
-        @media (min-width: 768px) { .grid { grid-template-columns: 3fr 2fr; } }
-
-        .card { 
-            background: var(--card-bg); 
-            border: 1px solid var(--border);
-            padding: 24px; 
-            border-radius: 12px; 
-            box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1); 
-        }
-        h2 { margin-top: 0; font-size: 1.25rem; font-weight: 600; display: flex; align-items: center; gap: 8px; }
-        
-        .form-group { margin-bottom: 20px; }
-        label { display: block; font-size: 0.875rem; font-weight: 500; margin-bottom: 6px; color: var(--text-main); }
-        
-        input[type="text"], input[type="file"] { 
-            width: 100%; 
-            padding: 10px 12px; 
-            border: 1px solid var(--border); 
-            border-radius: 6px;
-            font-size: 0.95rem;
-            transition: border-color 0.2s, box-shadow 0.2s;
-        }
-        input:focus {
-            outline: none;
-            border-color: var(--primary);
-            box-shadow: 0 0 0 3px rgba(79, 70, 229, 0.1);
-        }
-        
-        button { 
-            background: var(--primary); 
-            color: white; 
-            border: none; 
-            padding: 12px 20px; 
-            border-radius: 6px; 
-            font-weight: 600;
-            cursor: pointer; 
-            width: 100%;
-            transition: background 0.2s;
-        }
-        button:hover { background: var(--primary-hover); }
-        button.secondary { background: white; color: var(--text-main); border: 1px solid var(--border); margin-top: 12px; }
-        button.secondary:hover { background: #f1f5f9; }
-
-        pre { 
-            background: #1e293b; 
-            color: #e2e8f0;
-            padding: 16px; 
-            border-radius: 8px; 
-            font-size: 0.85rem;
-            overflow-x: auto;
-            margin-top: 16px;
-        }
-
-        .status-badge {
-            display: inline-flex;
-            align-items: center;
-            padding: 2px 8px;
-            border-radius: 99px;
-            font-size: 0.75rem;
-            font-weight: 600;
-            background: #f1f5f9;
-        }
-        .status-ok { background: #dcfce7; color: #166534; }
+        body { font-family: 'Inter', sans-serif; background-color: #0f172a; color: #f8fafc; }
+        .stat-card { background: #1e293b; border: 1px solid #334155; transition: all 0.3s ease; }
+        .stat-card:hover { border-color: #4f46e5; transform: translateY(-2px); }
     </style>
 </head>
-<body>
-    <div class="header">
-        <h1>DVR Upload System</h1>
-        <p>Developer Testing Dashboard - Version 2.0.22</p>
-    </div>
-    
-    <div class="grid">
-        <div class="card">
-            <h2>📤 Simulate Upload</h2>
-            <form action="/upload" method="post" enctype="multipart/form-data">
-                <div class="form-group">
-                    <label>File (TS, MP4 or Images)</label>
-                    <input type="file" name="file" required>
-                </div>
-                <div class="form-group">
-                    <label>Filename (Override)</label>
-                    <input type="text" name="filename" placeholder="e.g. test_video.mp4">
-                    <small style="color:var(--text-muted); font-size:0.75rem">Leave empty to use original filename</small>
-                </div>
-                <div style="display:grid; grid-template-columns: 1fr 1fr; gap: 12px;">
-                    <div class="form-group">
-                        <label>Timestamp</label>
-                        <input type="text" name="timestamp" id="ts_field">
+<body class="p-4 md:p-8">
+    <div class="max-w-7xl mx-auto">
+        <div class="flex flex-col md:flex-row justify-between items-center mb-10 gap-6">
+            <div>
+                <div class="flex items-center gap-3">
+                    <div class="p-2 bg-indigo-600 rounded-lg">
+                        <svg class="w-6 h-6 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"></path></svg>
                     </div>
-                    <div class="form-group">
-                        <label>IMEI</label>
-                        <input type="text" name="imei" id="imei_field" value="864993060014264">
+                    <h1 class="text-3xl font-bold text-white tracking-tight">DVR Service Monitor</h1>
+                </div>
+                <p class="text-slate-400 mt-2 ml-1">Performance em tempo real e sincronização em nuvem</p>
+            </div>
+            
+            <div class="flex items-center bg-slate-800/50 p-2 rounded-2xl border border-slate-700">
+                <div class="px-4 border-r border-slate-700">
+                    <div class="flex items-center gap-2">
+                        <span id="status-dot" class="h-2.5 w-2.5 rounded-full bg-green-500 animate-pulse"></span>
+                        <span id="status-text" class="text-xs font-bold uppercase tracking-widest text-slate-300">Operacional</span>
                     </div>
                 </div>
-                <div class="form-group" id="sign_group" style="display:none;">
-                    <label>Signature Token (Auto-generated)</label>
-                    <input type="text" name="sign" id="sign_field" readonly style="background:#f1f5f9; cursor:not-allowed;">
+                <div class="px-4 text-xs font-mono text-indigo-400">
+                    Up: <span id="uptime">0s</span>
                 </div>
-                <button type="submit">Upload Now</button>
-            </form>
+                <button onclick="refreshData()" class="ml-2 p-2 hover:bg-slate-700 rounded-xl transition-colors text-slate-400 hover:text-white">
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
+                </button>
+            </div>
         </div>
 
-        <div class="card">
-            <h2>🔍 System Health</h2>
-            <div id="health_summary" style="margin-bottom: 20px;">
-                <p style="font-size:0.9rem; margin: 5px 0;">S3 Storage: <span class="status-badge" id="s3_badge">pending...</span></p>
-                <p style="font-size:0.9rem; margin: 5px 0;">RabbitMQ: <span class="status-badge" id="rmq_badge">pending...</span></p>
+        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-5 mb-8">
+            <div class="stat-card p-6 rounded-3xl relative overflow-hidden">
+                <p class="text-[10px] font-bold text-slate-500 uppercase tracking-widest">Total de Arquivos</p>
+                <h2 id="media-total" class="text-4xl font-black mt-2 text-white">0</h2>
+                <div class="mt-4 flex items-center gap-2">
+                    <span class="text-[10px] text-green-400 font-bold" id="success-count">OK: 0</span>
+                    <span class="text-[10px] text-red-400 font-bold" id="fail-count">FAIL: 0</span>
+                </div>
             </div>
-            <button class="secondary" onclick="checkHealth()">Refresh Health Status</button>
-            <pre id="health_result">Click refresh to load stats...</pre>
+
+            <div class="stat-card p-6 rounded-3xl">
+                <p class="text-[10px] font-bold text-slate-500 uppercase tracking-widest">Latência Câmera</p>
+                <h2 id="avg-camera" class="text-4xl font-black text-indigo-400 mt-2">0s</h2>
+                <p class="text-[10px] text-slate-500 mt-4 italic">Média de envio da câmera</p>
+            </div>
+
+            <div class="stat-card p-6 rounded-3xl">
+                <p class="text-[10px] font-bold text-slate-500 uppercase tracking-widest">Processamento</p>
+                <h2 id="avg-conversion" class="text-4xl font-black text-purple-400 mt-2">0s</h2>
+                <p class="text-[10px] text-slate-500 mt-4 italic">Média CPU FFmpeg</p>
+            </div>
+
+            <div class="stat-card p-6 rounded-3xl">
+                <p class="text-[10px] font-bold text-slate-500 uppercase tracking-widest">Upload Nuvem</p>
+                <h2 id="avg-s3" class="text-4xl font-black text-emerald-400 mt-2">0s</h2>
+                <p class="text-[10px] text-slate-500 mt-4 italic">Média Latência S3</p>
+            </div>
+        </div>
+
+        <div class="grid grid-cols-1 lg:grid-cols-3 gap-8">
+            <div class="stat-card p-8 rounded-3xl lg:col-span-1">
+                <h3 class="text-sm font-bold mb-6 text-white uppercase tracking-widest">Integridade</h3>
+                <div class="space-y-4">
+                    <div class="flex justify-between items-center p-3 bg-slate-800/40 rounded-xl border border-slate-700/50">
+                        <span class="text-xs text-slate-400">S3 Storage</span>
+                        <span id="badge-s3" class="text-[10px] font-black px-2 py-1 rounded-md uppercase">...</span>
+                    </div>
+                    <div class="flex justify-between items-center p-3 bg-slate-800/40 rounded-xl border border-slate-700/50">
+                        <span class="text-xs text-slate-400">RabbitMQ</span>
+                        <span id="badge-rmq" class="text-[10px] font-black px-2 py-1 rounded-md uppercase">...</span>
+                    </div>
+                    <div class="pt-4 border-t border-slate-700/50 text-right">
+                        <span class="text-[10px] text-slate-500 uppercase tracking-widest">Última Atividade:</span>
+                        <p id="last-at" class="text-[10px] font-mono text-slate-400">Never</p>
+                    </div>
+                </div>
+            </div>
+
+            <div class="stat-card p-8 rounded-3xl lg:col-span-2 bg-gradient-to-br from-slate-800 to-slate-900 border-indigo-500/20">
+                <h3 class="text-sm font-bold mb-6 text-white uppercase tracking-widest">Simular Upload</h3>
+                <form id="uploadForm" class="space-y-4">
+                    <div class="grid grid-cols-2 gap-4">
+                        <input type="file" name="file" required class="col-span-2 text-xs text-slate-400 file:mr-4 file:py-2 file:px-4 file:rounded-lg file:border-0 file:text-[10px] file:font-bold file:bg-indigo-600 file:text-white bg-slate-800/50 rounded-lg p-1">
+                        <input type="text" name="filename" placeholder="Override Filename" class="bg-slate-800/50 border border-slate-700 rounded-lg p-2 text-xs text-white outline-none focus:border-indigo-500">
+                        <input type="text" name="imei" value="864993060014264" class="bg-slate-800/50 border border-slate-700 rounded-lg p-2 text-xs text-white outline-none">
+                    </div>
+                    <button type="submit" class="w-full bg-indigo-600 hover:bg-indigo-500 text-white font-bold py-2 rounded-lg text-xs transition-all active:scale-[0.98]">ENVIAR ARQUIVO</button>
+                    <div id="uploadStatus" class="mt-4 p-3 bg-black/40 rounded-lg hidden border border-white/5 font-mono text-[10px] text-indigo-400">
+                        <pre id="responseOutput" class="whitespace-pre-wrap"></pre>
+                    </div>
+                </form>
+            </div>
         </div>
     </div>
 
@@ -250,71 +250,77 @@ func (h *Handler) TestPageHandler(w http.ResponseWriter, r *http.Request) {
         const secretKey = "{{.SecretKey}}";
         const enableSecret = {{.EnableSecret}};
 
-        if (enableSecret) {
-            document.getElementById('sign_group').style.display = 'block';
-        }
-
-        function generateSignature(updateTimestamp = true) {
-            if (!enableSecret) return;
-            
-            if (updateTimestamp) {
-                document.getElementById('ts_field').value = Date.now();
-            }
-            
-            const filenameInput = document.getElementsByName('filename')[0].value;
-            const fileInput = document.getElementsByName('file')[0];
-            const timestamp = document.getElementById('ts_field').value;
-            
-            let nameToSign = filenameInput.trim();
-            if (!nameToSign && fileInput.files.length > 0) {
-                nameToSign = fileInput.files[0].name;
-            }
-
-            if (nameToSign) {
-                const hash = CryptoJS.MD5(nameToSign + timestamp + secretKey).toString();
-                const base64Sign = btoa(hash);
-                document.getElementById('sign_field').value = base64Sign;
-            }
-        }
-
-        document.getElementById('ts_field').value = Date.now();
-        
-        document.getElementsByName('filename')[0].addEventListener('input', () => generateSignature(true));
-        document.getElementsByName('file')[0].addEventListener('change', () => generateSignature(true));
-        document.getElementById('ts_field').addEventListener('input', () => generateSignature(false));
-
-        async function checkHealth() {
+        async function refreshData() {
             try {
                 const res = await fetch('/health');
-                const data = await res.json();
-                document.getElementById('health_result').innerText = JSON.stringify(data, null, 2);
-                
-                const s3 = data.data.dependencies.s3_storage;
-                const rmq = data.data.dependencies.rabbitmq;
-                
-                const s3Badge = document.getElementById('s3_badge');
-                s3Badge.innerText = s3 === 'ok' ? 'Online' : 'Error';
-                s3Badge.className = 'status-badge ' + (s3 === 'ok' ? 'status-ok' : '');
-                
-                const rmqBadge = document.getElementById('rmq_badge');
-                rmqBadge.innerText = rmq === 'ok' ? 'Online' : (rmq === 'not_configured' ? 'N/A' : 'Error');
-                rmqBadge.className = 'status-badge ' + (rmq === 'ok' ? 'status-ok' : '');
-                
-            } catch (e) {
-                document.getElementById('health_result').innerText = "Failed to connect to /health";
+                const d = await res.json();
+                const metrics = d.data.metrics;
+                const deps = d.data.dependencies;
+
+                document.getElementById('media-total').innerText = d.data.media_total_count;
+                document.getElementById('success-count').innerText = "OK: " + d.data.successful_uploads;
+                document.getElementById('fail-count').innerText = "FAIL: " + d.data.failed_uploads;
+                document.getElementById('avg-camera').innerText = metrics.avg_camera_send_time;
+                document.getElementById('avg-conversion').innerText = metrics.avg_conversion_time;
+                document.getElementById('avg-s3').innerText = metrics.avg_s3_upload_time;
+                document.getElementById('uptime').innerText = d.data.uptime;
+                document.getElementById('last-at').innerText = d.data.last_processed_at || 'None';
+
+                updateBadge('badge-s3', deps.s3_storage);
+                updateBadge('badge-rmq', deps.rabbitmq);
+            } catch (err) {}
+        }
+
+        function updateBadge(id, status) {
+            const el = document.getElementById(id);
+            if (status === 'ok') {
+                el.innerText = 'ONLINE';
+                el.className = 'text-[10px] font-black px-2 py-1 bg-green-500/10 text-green-400 rounded-md';
+            } else if (status === 'not_configured') {
+                el.innerText = 'N/A';
+                el.className = 'text-[10px] font-black px-2 py-1 bg-slate-700/50 text-slate-500 rounded-md';
+            } else {
+                el.innerText = 'OFFLINE';
+                el.className = 'text-[10px] font-black px-2 py-1 bg-red-500/10 text-red-500 rounded-md';
             }
         }
 
-        // Initial check
-        checkHealth();
+        document.getElementById('uploadForm').onsubmit = async (e) => {
+            e.preventDefault();
+            const statusDiv = document.getElementById('uploadStatus');
+            const output = document.getElementById('responseOutput');
+            statusDiv.classList.remove('hidden');
+            output.innerText = "Transmitting...";
+            
+            const formData = new FormData(e.target);
+            const ts = Date.now().toString();
+            formData.append('timestamp', ts);
+
+            if (enableSecret) {
+                const fileName = e.target.filename.value || e.target.file.files[0].name;
+                const hash = CryptoJS.MD5(fileName + ts + secretKey).toString();
+                formData.append('sign', btoa(hash));
+            }
+
+            try {
+                const res = await fetch('/upload', { method: 'POST', body: formData });
+                const result = await res.json();
+                output.innerText = JSON.stringify(result, null, 2);
+                setTimeout(refreshData, 1000);
+            } catch (err) {
+                output.innerText = "Error: " + err.message;
+            }
+        }
+
+        setInterval(refreshData, 3000);
+        refreshData();
     </script>
 </body>
 </html>
 `
-	w.Header().Set("Content-Type", "text/html")
-	w.WriteHeader(http.StatusOK)
 
-	// Injetar variáveis do servidor no template HTML
+	w.Header().Set("Content-Type", "text/html")
+
 	tmpl := strings.ReplaceAll(html, "{{.SecretKey}}", h.cfg.SecretKey)
 	if h.cfg.EnableSecret {
 		tmpl = strings.ReplaceAll(tmpl, "{{.EnableSecret}}", "true")
@@ -436,7 +442,13 @@ func (h *Handler) UploadHandler(w http.ResponseWriter, r *http.Request) {
 			}
 			handlerSize = n
 			tempFile.Close() // Fecha o arquivo pois já terminou a escrita do stream
-			continue         // Já processamos o arquivo
+
+			// Métrica: Tempo que a câmera levou para enviar o arquivo
+			sendDuration := time.Since(startTime)
+			atomic.AddInt64(&h.totalCameraSendTime, int64(sendDuration))
+			atomic.AddInt64(&h.cameraSendCount, 1)
+
+			continue // Já processamos o arquivo
 		}
 
 		// Processar outros campos do formulário
@@ -600,8 +612,13 @@ func (h *Handler) UploadHandler(w http.ResponseWriter, r *http.Request) {
 
 		// Conversão opcional TS -> MP4 antes do upload.
 		if ext == ".ts" && h.cfg.EnableTsToMp4 {
+			convStart := time.Now()
 			convertedPath, err := processor.ConvertTSToMP4(path, logger)
 			if err == nil {
+				// Métrica: Sucesso na conversão
+				atomic.AddInt64(&h.totalConversionTime, int64(time.Since(convStart)))
+				atomic.AddInt64(&h.conversionCount, 1)
+
 				// Captura o novo tamanho após conversão
 				if stat, statErr := os.Stat(convertedPath); statErr == nil {
 					currentSize = stat.Size()
@@ -623,8 +640,13 @@ func (h *Handler) UploadHandler(w http.ResponseWriter, r *http.Request) {
 		// Mantém a compressão atual apenas para MP4 (se aplicável).
 		// Se o arquivo original era JPEG ou outro formato, ele pulará este bloco e irá direto para S3
 		if ext == ".mp4" {
+			compStart := time.Now()
 			compressedPath, err := processor.CompressWithFFmpeg(uploadPath, logger)
 			if err == nil {
+				// Somar tempo de compressão à métrica de conversão
+				atomic.AddInt64(&h.totalConversionTime, int64(time.Since(compStart)))
+				atomic.AddInt64(&h.conversionCount, 1)
+
 				// Comparar tamanhos: se o comprimido for maior que o original (comum com CRF 0 ou arquivos pequenos),
 				// descartamos o comprimido e usamos o original.
 				origStat, errOrig := os.Stat(uploadPath)
@@ -646,15 +668,18 @@ func (h *Handler) UploadHandler(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if h.cfg.EnableS3Upload {
+			s3Start := time.Now()
 			if err := h.storage.UploadFileToS3(uploadPath, uploadFilename, logger); err != nil {
 				logger.Error("Failed to upload to S3", "error", err)
 				atomic.AddInt64(&h.failedUploads, 1)
 				return
 			}
+			// Métrica: Sucesso no upload S3
+			atomic.AddInt64(&h.totalS3UploadTime, int64(time.Since(s3Start)))
+			atomic.AddInt64(&h.s3UploadCount, 1)
 			atomic.AddInt64(&h.successfulUploads, 1)
 		} else {
-			logger.Info("S3 upload skipped (disabled by config)")
-			// Consideramos sucesso local se o upload está desabilitado
+			// Apenas incrementa sucesso se não houver upload externo habilitado
 			atomic.AddInt64(&h.successfulUploads, 1)
 		}
 
